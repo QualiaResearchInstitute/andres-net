@@ -16,17 +16,28 @@ import {
   setPlaneSelection,
   setPlaneSolo,
   updateImageOutlineWidth as updateImageOutlineWidthLayers,
+  applyPlaneOrder,
+  getPlaneOrder,
+  deletePlanes as deletePlanesFromLayers,
+  transformPlaneShape,
+  booleanCombinePlanes,
+  PlaneTransformAction,
+  PlaneBooleanAction,
 } from "./layers";
 import { renderFrame } from "./renderFrame";
 import {
   clearWalls as clearWallsSim,
   createSimulation,
+  setNoiseSeed,
   recomputePotential,
   resetPhases as resetPhasesSim,
   updateOmegaSpread,
 } from "./simulation";
 import { stepSimulation, StepConfig } from "./stepSimulation";
+import type { AttentionMods } from "./stepSimulation";
+import { updateAttentionFields } from "./attention";
 import { DrawingState, PlaneLayer, SimulationState } from "./types";
+import { ReflectorGraph } from "./graph/ReflectorGraph";
 
 export type KuramotoEngineConfig = {
   W: number;
@@ -39,12 +50,15 @@ export type KuramotoEngineConfig = {
   emGain: number;
   wallBarrier: number;
   imageTool: boolean;
+  transformTool: boolean;
   showImages: boolean;
   imageOutlineWidth: number;
   showWalls: boolean;
   showLines: boolean;
   showOutlines: boolean;
   showDagDepth: boolean;
+  showRhoOverlay: boolean;
+  showDefectsOverlay: boolean;
   energyBaseline: number;
   energyLeak: number;
   energyDiff: number;
@@ -94,7 +108,13 @@ export type KuramotoEngineConfig = {
   swWeight: number;
   swNegFrac: number;
   reseedGraphKey: number;
+  // Attention
+  attentionEnabled: boolean;
+  attentionParams: import("./attention").AttentionParams;
+  attentionHeads: import("./attention").AttentionHead[];
   setImageOutlineWidth: (width: number) => void;
+  onPlaneContextMenu?: (info: { planeId: number; screenX: number; screenY: number }) => void;
+  onPlaneContextMenuClose?: () => void;
 };
 
 export type KuramotoEngineApi = {
@@ -102,6 +122,7 @@ export type KuramotoEngineApi = {
   overlayCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
   step: (dt: number) => void;
+  stepWithSeed: (dt: number, seed: number | null) => void;
   resetPhases: () => void;
   clearWalls: () => void;
   clearPlanes: () => void;
@@ -118,7 +139,17 @@ export type KuramotoEngineApi = {
   togglePlaneMuted: (planeId: number, value: boolean) => void;
   togglePlaneLocked: (planeId: number, value: boolean) => void;
   reorderPlane: (sourcePlaneId: number, targetPlaneId: number | null) => void;
+  undoPlaneOrder: () => void;
+  redoPlaneOrder: () => void;
+  canUndoPlaneOrder: () => boolean;
+  canRedoPlaneOrder: () => boolean;
+  deletePlanes: (mode: "keep-wall" | "keep-energy" | "clean") => void;
+  setTransportNoiseSeed: (seed: number) => void;
+  getTransportNoiseSeed: () => number;
+  transformPlane: (planeId: number, action: PlaneTransformAction) => void;
+  combinePlanes: (basePlaneId: number, otherPlaneIds: number[], action: PlaneBooleanAction) => void;
   subscribeLayerChanges: (listener: () => void) => () => void;
+  getSim: () => SimulationState | null;
 };
 
 export type PlaneLayerSnapshot = {
@@ -144,6 +175,14 @@ function disposeImages(draw: DrawingState) {
   });
 }
 
+function ordersEqual(a: number[] | undefined, b: number[]) {
+  if (!a || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineApi {
   const {
     W,
@@ -156,12 +195,15 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     emGain,
     wallBarrier,
     imageTool,
+    transformTool,
     showImages,
     imageOutlineWidth,
     showWalls,
     showLines,
     showOutlines,
     showDagDepth,
+    showRhoOverlay,
+    showDefectsOverlay,
     energyBaseline,
     energyLeak,
     energyDiff,
@@ -211,7 +253,13 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     swWeight,
     swNegFrac,
     reseedGraphKey,
+    // Attention
+    attentionEnabled,
+    attentionParams,
+    attentionHeads,
     setImageOutlineWidth,
+    onPlaneContextMenu,
+    onPlaneContextMenuClose,
   } = config;
 
   const fieldCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -222,6 +270,25 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
   const drawRef = useRef<DrawingState>(createDrawingState());
   const layerVersionRef = useRef(0);
   const layerListenersRef = useRef<Set<() => void>>(new Set());
+  const attentionTimeRef = useRef(0);
+  const attentionModsRef = useRef<AttentionMods | undefined>(undefined);
+  const MAX_PLANE_ORDER_HISTORY = 64;
+
+  const pushPlaneOrderSnapshot = useCallback(() => {
+    const draw = drawRef.current;
+    if (!draw) return;
+    const order = getPlaneOrder(draw);
+    if (order.length === 0) return;
+    const undoStack = draw.planeOrderUndo;
+    const last = undoStack[undoStack.length - 1];
+    if (!ordersEqual(last, order)) {
+      undoStack.push([...order]);
+      if (undoStack.length > MAX_PLANE_ORDER_HISTORY) {
+        undoStack.shift();
+      }
+    }
+    draw.planeOrderRedo = [];
+  }, []);
 
   const notifyLayersChanged = useCallback(() => {
     layerVersionRef.current += 1;
@@ -287,6 +354,7 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
       dagDepthOrdering,
       dagDepthFiltering,
       dagLogStats,
+      attentionMods: attentionModsRef.current,
       horizonFactor,
     }),
     [
@@ -343,6 +411,8 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
       reseedGraphKey,
     });
     simRef.current = simulation;
+    // Instantiate ReflectorGraph once per simulation (opt-in source for A)
+    (simRef.current as any)._reflectorGraph = (simRef.current as any)._reflectorGraph ?? new ReflectorGraph(W, H);
     if (shouldResetDrawing) {
       disposeImages(drawRef.current);
       drawRef.current = createDrawingState();
@@ -399,10 +469,13 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
       closeThreshold,
       autoClose,
       imageTool,
+      transformTool,
+      openContextMenu: onPlaneContextMenu,
+      closeContextMenu: onPlaneContextMenuClose,
       onLayersChanged: notifyLayersChanged,
     });
     return cleanup;
-  }, [W, H, pixelSize, lineWidth, emBlur, closeThreshold, autoClose, imageTool, notifyLayersChanged]);
+  }, [W, H, pixelSize, lineWidth, emBlur, closeThreshold, autoClose, imageTool, transformTool, notifyLayersChanged, onPlaneContextMenu, onPlaneContextMenuClose]);
 
   useEffect(() => {
     const sim = simRef.current;
@@ -410,69 +483,8 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     recomputePotential(sim, emBlur);
   }, [emBlur, W, H]);
 
-  useEffect(() => {
-    const loop = () => {
-      const sim = simRef.current;
-      if (sim) {
-        if (!paused) {
-          for (let s = 0; s < stepsPerFrame; s++) {
-            stepSimulation(sim, buildStepConfig(dt));
-          }
-        }
-        renderFrame(
-          sim,
-          drawRef.current,
-          { field: fieldCanvasRef.current, overlay: overlayCanvasRef.current },
-          {
-            pixelSize,
-            showWalls,
-            showLines,
-            showOutlines,
-            showDagDepth,
-            showImages,
-            stereo,
-            stereoAlpha,
-            ipd,
-            brightnessBase,
-            energyGamma,
-            liftGain,
-            hyperCurve,
-          },
-        );
-      }
-      rafRef.current = requestAnimationFrame(loop);
-    };
-    rafRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [
-    paused,
-    stepsPerFrame,
-    buildStepConfig,
-    dt,
-    pixelSize,
-    showWalls,
-    showLines,
-    showOutlines,
-    showDagDepth,
-    showImages,
-    stereo,
-    stereoAlpha,
-    ipd,
-    brightnessBase,
-    energyGamma,
-    liftGain,
-    hyperCurve,
-  ]);
-
-  useEffect(() => {
-    return () => disposeImages(drawRef.current);
-  }, []);
-
-  const stepOnce = useCallback(
-    (dtOverride: number) => {
-      const sim = simRef.current;
-      if (!sim) return;
-      stepSimulation(sim, buildStepConfig(dtOverride));
+  const renderCurrentFrame = useCallback(
+    (sim: SimulationState) => {
       renderFrame(
         sim,
         drawRef.current,
@@ -491,11 +503,13 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
           energyGamma,
           liftGain,
           hyperCurve,
+          showTransformHandles: transformTool,
+          showRhoOverlay,
+          showDefectsOverlay,
         },
       );
     },
     [
-      buildStepConfig,
       pixelSize,
       showWalls,
       showLines,
@@ -509,6 +523,98 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
       energyGamma,
       liftGain,
       hyperCurve,
+      transformTool,
+    ],
+  );
+
+  const runSimulationSteps = useCallback(
+    (sim: SimulationState, cfg: StepConfig) => {
+      for (let s = 0; s < stepsPerFrame; s++) {
+        stepSimulation(sim, cfg);
+      }
+    },
+    [stepsPerFrame],
+  );
+
+  useEffect(() => {
+    const loop = () => {
+      const sim = simRef.current;
+      if (sim) {
+        if (!paused) {
+          if (attentionEnabled) {
+            const out = updateAttentionFields(sim, attentionHeads, attentionParams, dt, attentionTimeRef.current, wrap);
+            attentionModsRef.current = {
+              Aact: out.Aact,
+              Uact: out.Uact,
+              lapA: out.lapA,
+              divU: out.divU,
+              gammaK: attentionParams.gammaK,
+              betaK: attentionParams.betaK,
+              gammaAlpha: attentionParams.gammaAlpha,
+              betaAlpha: attentionParams.betaAlpha,
+              gammaD: attentionParams.gammaD,
+              deltaD: attentionParams.deltaD,
+            };
+            attentionTimeRef.current += dt * stepsPerFrame;
+          } else {
+            attentionModsRef.current = undefined;
+          }
+          const cfg = buildStepConfig(dt);
+          runSimulationSteps(sim, cfg);
+        }
+        renderCurrentFrame(sim);
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [
+    paused,
+    buildStepConfig,
+    dt,
+    renderCurrentFrame,
+    runSimulationSteps,
+    attentionEnabled,
+    attentionParams,
+    attentionHeads,
+    stepsPerFrame,
+    wrap,
+  ]);
+
+  useEffect(() => {
+    return () => disposeImages(drawRef.current);
+  }, []);
+
+  const stepOnce = useCallback(
+    (dtOverride: number) => {
+      const sim = simRef.current;
+      if (!sim) return;
+      const cfg = buildStepConfig(dtOverride);
+      runSimulationSteps(sim, cfg);
+      renderCurrentFrame(sim);
+    },
+    [
+      buildStepConfig,
+      renderCurrentFrame,
+      runSimulationSteps,
+    ],
+  );
+
+  const stepWithSeed = useCallback(
+    (dtOverride: number, seed: number | null) => {
+      const sim = simRef.current;
+      if (!sim) return;
+      if (seed !== null) {
+        setNoiseSeed(sim, seed);
+      }
+      const cfg = buildStepConfig(dtOverride);
+      runSimulationSteps(sim, cfg);
+      renderCurrentFrame(sim);
+    },
+    [
+      buildStepConfig,
+      renderCurrentFrame,
+      runSimulationSteps,
     ],
   );
 
@@ -669,12 +775,136 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     (sourcePlaneId: number, targetPlaneId: number | null) => {
       const sim = simRef.current;
       if (!sim) return;
-      if (!reorderPlaneLayer(sim, drawRef.current, sourcePlaneId, targetPlaneId)) return;
+      const draw = drawRef.current;
+      const prevLength = draw.planeOrderUndo.length;
+      pushPlaneOrderSnapshot();
+      const snapshotAdded = draw.planeOrderUndo.length > prevLength;
+      if (!reorderPlaneLayer(sim, drawRef.current, sourcePlaneId, targetPlaneId)) {
+        if (snapshotAdded) {
+          draw.planeOrderUndo.pop();
+        }
+        return;
+      }
       recomputePlaneDepthFromLayers(sim, drawRef.current);
       rebuildWallFromLayers(sim, drawRef.current, pixelSize, lineWidth, emBlur);
       notifyLayersChanged();
     },
-    [emBlur, lineWidth, pixelSize, notifyLayersChanged],
+    [emBlur, lineWidth, pixelSize, notifyLayersChanged, pushPlaneOrderSnapshot],
+  );
+
+  const undoPlaneOrder = useCallback(() => {
+    const sim = simRef.current;
+    const draw = drawRef.current;
+    if (!sim || !draw) return;
+    if (draw.planeOrderUndo.length === 0) return;
+    const target = draw.planeOrderUndo.pop();
+    if (!target) return;
+    const current = getPlaneOrder(draw);
+    const applied = applyPlaneOrder(sim, draw, target, pixelSize, lineWidth, emBlur);
+    if (!applied) {
+      draw.planeOrderUndo.push(target);
+      return;
+    }
+    draw.planeOrderRedo.push(current);
+    notifyLayersChanged();
+  }, [emBlur, lineWidth, pixelSize, notifyLayersChanged]);
+
+  const redoPlaneOrder = useCallback(() => {
+    const sim = simRef.current;
+    const draw = drawRef.current;
+    if (!sim || !draw) return;
+    if (draw.planeOrderRedo.length === 0) return;
+    const target = draw.planeOrderRedo.pop();
+    if (!target) return;
+    const current = getPlaneOrder(draw);
+    const applied = applyPlaneOrder(sim, draw, target, pixelSize, lineWidth, emBlur);
+    if (!applied) {
+      draw.planeOrderRedo.push(target);
+      return;
+    }
+    draw.planeOrderUndo.push(current);
+    if (draw.planeOrderUndo.length > MAX_PLANE_ORDER_HISTORY) {
+      draw.planeOrderUndo.shift();
+    }
+    notifyLayersChanged();
+  }, [emBlur, lineWidth, pixelSize, notifyLayersChanged]);
+
+  const canUndoPlaneOrder = useCallback(() => {
+    const draw = drawRef.current;
+    return draw ? draw.planeOrderUndo.length > 0 : false;
+  }, []);
+
+  const canRedoPlaneOrder = useCallback(() => {
+    const draw = drawRef.current;
+    return draw ? draw.planeOrderRedo.length > 0 : false;
+  }, []);
+
+  const setTransportNoiseSeed = useCallback((seed: number) => {
+    const sim = simRef.current;
+    if (!sim) return;
+    setNoiseSeed(sim, seed);
+  }, []);
+
+  const getTransportNoiseSeed = useCallback(() => {
+    const sim = simRef.current;
+    return sim ? sim.noiseSeed : 0;
+  }, []);
+
+  const deletePlanes = useCallback(
+    (mode: "keep-wall" | "keep-energy" | "clean") => {
+      const sim = simRef.current;
+      const draw = drawRef.current;
+      if (!sim || !draw) return;
+      if (draw.selectedPlaneIds.length === 0) return;
+      pushPlaneOrderSnapshot();
+      const changed = deletePlanesFromLayers(
+        sim,
+        draw,
+        [...draw.selectedPlaneIds],
+        mode,
+        pixelSize,
+        lineWidth,
+        emBlur,
+        energyBaseline,
+      );
+      if (!changed) return;
+      notifyLayersChanged();
+    },
+    [pushPlaneOrderSnapshot, pixelSize, lineWidth, emBlur, energyBaseline, notifyLayersChanged],
+  );
+
+  const transformPlane = useCallback(
+    (planeId: number, action: PlaneTransformAction) => {
+      const sim = simRef.current;
+      const draw = drawRef.current;
+      if (!sim || !draw) return;
+      const changed = transformPlaneShape(sim, draw, planeId, action, pixelSize, lineWidth, emBlur);
+      if (!changed) return;
+      notifyLayersChanged();
+    },
+    [pixelSize, lineWidth, emBlur, notifyLayersChanged],
+  );
+
+  const combinePlanes = useCallback(
+    (basePlaneId: number, otherPlaneIds: number[], action: PlaneBooleanAction) => {
+      const sim = simRef.current;
+      const draw = drawRef.current;
+      if (!sim || !draw) return;
+      if (otherPlaneIds.length === 0) return;
+      const changed = booleanCombinePlanes(
+        sim,
+        draw,
+        basePlaneId,
+        otherPlaneIds,
+        action,
+        pixelSize,
+        lineWidth,
+        emBlur,
+      );
+      if (!changed) return;
+      notifyLayersChanged();
+    },
+    [pixelSize, lineWidth, emBlur, notifyLayersChanged],
   );
 
   return {
@@ -682,6 +912,7 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     overlayCanvasRef,
     fileInputRef,
     step: stepOnce,
+    stepWithSeed,
     resetPhases,
     clearWalls,
     clearPlanes,
@@ -698,6 +929,16 @@ export function useKuramotoEngine(config: KuramotoEngineConfig): KuramotoEngineA
     togglePlaneMuted,
     togglePlaneLocked,
     reorderPlane,
+    undoPlaneOrder,
+    redoPlaneOrder,
+    canUndoPlaneOrder,
+    canRedoPlaneOrder,
+    deletePlanes,
+    setTransportNoiseSeed,
+    getTransportNoiseSeed,
+    transformPlane,
+    combinePlanes,
     subscribeLayerChanges,
+    getSim: () => simRef.current,
   };
 }

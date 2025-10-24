@@ -1,6 +1,19 @@
 import { clamp, idx, TAU } from "./math";
-import { ensureDagCache } from "./simulation";
+import { ensureDagCache, nextNoise } from "./simulation";
 import { SimulationState } from "./types";
+
+export type AttentionMods = {
+  Aact: Float32Array;
+  Uact: Float32Array;
+  lapA: Float32Array;
+  divU: Float32Array;
+  gammaK: number;
+  betaK: number;
+  gammaAlpha: number;
+  betaAlpha: number;
+  gammaD: number;
+  deltaD: number;
+};
 
 export type StepConfig = {
   dt: number;
@@ -37,6 +50,7 @@ export type StepConfig = {
   dagDepthOrdering: boolean;
   dagDepthFiltering: boolean;
   dagLogStats: boolean;
+  attentionMods?: AttentionMods;
   horizonFactor: (iInside: boolean, jInside: boolean, receiverInside: boolean) => number;
 };
 
@@ -77,6 +91,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
     dagDepthFiltering,
     dagLogStats,
     horizonFactor,
+    attentionMods,
   } = config;
 
   const {
@@ -202,7 +217,16 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           const jIn = !!surfMask[j];
           const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
           const horizon = horizonFactor(iIn, jIn, iIn);
-          sum += barrierH * horizon * w * Math.sin(phases[j] - th);
+          {
+            let wEff = w;
+            let alphaBias = 0;
+            if (attentionMods) {
+              const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
+              wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+              alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+            }
+            sum += barrierH * horizon * wEff * Math.sin(phases[j] - th - alphaBias);
+          }
         }
         const sw = swEdges[i] as Array<[number, number]>;
         for (let k = 0; k < sw.length; k++) {
@@ -211,7 +235,16 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           const jIn = !!surfMask[j];
           const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
           const horizon = horizonFactor(iIn, jIn, iIn);
-          sum += barrierH * horizon * w * Math.sin(phases[j] - th);
+          {
+            let wEff = w;
+            let alphaBias = 0;
+            if (attentionMods) {
+              const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
+              wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+              alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+            }
+            sum += barrierH * horizon * wEff * Math.sin(phases[j] - th - alphaBias);
+          }
         }
         let sumSurf = 0;
         if (surfMask[i]) sumSurf = alphaSurfToField * Math.sin(surfPhi[i] - th);
@@ -252,7 +285,16 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
             const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
             const horizon = horizonFactor(iIn, jIn, iIn);
             const source = depthOrdered ? (depthMask >= 0 ? snapshot[j] : phases[j]) : phases[j];
-            sum += barrierH * horizon * w * Math.sin(source - th);
+            {
+              let wEff = w;
+              let alphaBias = 0;
+              if (attentionMods) {
+                const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
+                wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+                alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+              }
+              sum += barrierH * horizon * wEff * Math.sin(source - th - alphaBias);
+            }
           }
           const sw = swEdges[i] as Array<[number, number]>;
           for (let k = 0; k < sw.length; k++) {
@@ -262,7 +304,16 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
             const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
             const horizon = horizonFactor(iIn, jIn, iIn);
             const source = depthOrdered ? (depthMask >= 0 ? snapshot[j] : phases[j]) : phases[j];
-            sum += barrierH * horizon * w * Math.sin(source - th);
+            {
+              let wEff = w;
+              let alphaBias = 0;
+              if (attentionMods) {
+                const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
+                wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+                alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+              }
+              sum += barrierH * horizon * wEff * Math.sin(source - th - alphaBias);
+            }
           }
           let sumSurf = 0;
           if (surfMask[i]) sumSurf = alphaSurfToField * Math.sin(surfPhi[i] - th);
@@ -277,8 +328,18 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
   }
 
   if (noiseAmp > 0) {
+    const mods = attentionMods;
     for (let i = 0; i < N; i++) {
-      phases[i] = (phases[i] + (Math.random() * 2 - 1) * noiseAmp * dt) % TAU;
+      const rnd = nextNoise(sim) * 2 - 1;
+      let amp = noiseAmp;
+      if (mods) {
+        amp = clamp(
+          noiseAmp * (1 - mods.gammaD * (mods.Aact[i] ?? 0)) + mods.deltaD * (mods.Uact[i] ?? 0),
+          0,
+          1.5 * Math.max(1e-6, noiseAmp)
+        );
+      }
+      phases[i] = (phases[i] + rnd * amp * dt) % TAU;
       if (phases[i] < 0) phases[i] += TAU;
     }
   }
