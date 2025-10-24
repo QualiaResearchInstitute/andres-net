@@ -202,6 +202,14 @@ export function createSimulation(prev: SimulationState | null, config: Simulatio
       stats: { step: 0, filtered: 0, used: 0, visited: 0, sweeps: 0 },
     },
     reseedKey: reseedGraphKey,
+    activePlaneIds:
+      prev && prev.N === N && !fullReset && prev.activePlaneIds
+        ? [...prev.activePlaneIds]
+        : [],
+    activePlaneSet:
+      prev && prev.N === N && !fullReset && prev.activePlaneIds
+        ? new Set(prev.activePlaneIds)
+        : new Set<number>(),
   };
 
   const shouldResetDrawing = !prev || fullReset || prev.N !== N;

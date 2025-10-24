@@ -105,7 +105,13 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
     dag,
   } = sim;
 
-  planeMeta.forEach((meta) => {
+  const activePlaneSet = sim.activePlaneSet ?? new Set<number>();
+  planeMeta.forEach((meta, planeId) => {
+    if (activePlaneSet.size > 0 && !activePlaneSet.has(planeId)) {
+      meta.R = 0;
+      meta.psi = 0;
+      return;
+    }
     let cr = 0,
       ci = 0;
     const cells = meta.cells;

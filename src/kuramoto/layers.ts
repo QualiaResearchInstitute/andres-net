@@ -5,6 +5,7 @@ import {
   ImageLayer,
   Layer,
   PlaneLayer,
+  PlaneMetadata,
   Point,
   SimulationState,
   StrokeLayer,
@@ -66,6 +67,135 @@ function depositImageOutline(sim: SimulationState, layer: ImageLayer, pixelSize:
   }
 }
 
+function ensurePlaneMetadataDefaults(meta: PlaneMetadata) {
+  if (meta.solo === undefined) meta.solo = false;
+  if (meta.muted === undefined) meta.muted = false;
+  if (meta.locked === undefined) meta.locked = false;
+  return meta;
+}
+
+function computePlaneMetadata(
+  sim: SimulationState,
+  planeId: number,
+  points: Point[],
+  existing?: PlaneMetadata,
+): PlaneMetadata | null {
+  const { W, H } = sim;
+  if (points.length < 3) return null;
+  let minx = Infinity;
+  let miny = Infinity;
+  let maxx = -Infinity;
+  let maxy = -Infinity;
+  for (const p of points) {
+    minx = Math.min(minx, p.x);
+    miny = Math.min(miny, p.y);
+    maxx = Math.max(maxx, p.x);
+    maxy = Math.max(maxy, p.y);
+  }
+  minx = Math.floor(clamp(minx, 0, W - 1));
+  maxx = Math.floor(clamp(maxx, 0, W - 1));
+  miny = Math.floor(clamp(miny, 0, H - 1));
+  maxy = Math.floor(clamp(maxy, 0, H - 1));
+
+  const cells: number[] = [];
+  for (let y = miny; y <= maxy; y++) {
+    for (let x = minx; x <= maxx; x++) {
+      if (pnpoly(points, x + 0.5, y + 0.5)) {
+        cells.push(y * W + x);
+      }
+    }
+  }
+  if (cells.length === 0) return null;
+
+  const cx = points.reduce((a, p) => a + p.x, 0) / points.length;
+  const cy = points.reduce((a, p) => a + p.y, 0) / points.length;
+  const signedArea = polygonSignedArea(points);
+  const orientationSign = signedArea === 0 ? 0 : signedArea > 0 ? 1 : -1;
+  const orientation = orientationSign === 0 ? "flat" : orientationSign > 0 ? "ccw" : "cw";
+  const color = existing?.color ?? hsvToRgb((planeId * 0.123) % 1, 0.7, 1.0);
+
+  const meta: PlaneMetadata = ensurePlaneMetadataDefaults(
+    existing ?? {
+      cells: Int32Array.from(cells),
+      R: 0,
+      psi: 0,
+      color,
+      centroid: { x: cx, y: cy },
+      orientation,
+      orientationSign,
+      solo: false,
+      muted: false,
+      locked: false,
+    },
+  );
+  meta.cells = Int32Array.from(cells);
+  meta.centroid = { x: cx, y: cy };
+  meta.orientation = orientation;
+  meta.orientationSign = orientationSign;
+  return meta;
+}
+
+function getPlaneLayers(draw: DrawingState) {
+  return draw.layers.filter((layer): layer is PlaneLayer => layer.kind === "plane");
+}
+
+function resolveActivePlaneIds(sim: SimulationState, draw: DrawingState): number[] {
+  const planeLayers = getPlaneLayers(draw);
+  const planeMeta = sim.planeMeta;
+  const soloIds: number[] = [];
+  planeLayers.forEach((layer) => {
+    const meta = planeMeta.get(layer.planeId);
+    if (!meta) return;
+    ensurePlaneMetadataDefaults(meta);
+    if (meta.solo && !meta.muted) {
+      soloIds.push(layer.planeId);
+    }
+  });
+  const restrictToSolo = soloIds.length > 0;
+  const soloSet = new Set(soloIds);
+  const active: number[] = [];
+  planeLayers.forEach((layer) => {
+    const meta = planeMeta.get(layer.planeId);
+    if (!meta) return;
+    ensurePlaneMetadataDefaults(meta);
+    if (meta.muted) return;
+    if (restrictToSolo && !soloSet.has(layer.planeId)) return;
+    active.push(layer.planeId);
+  });
+  return active;
+}
+
+export function recomputePlaneDepthFromLayers(
+  sim: SimulationState,
+  draw: DrawingState,
+) {
+  const { planeDepth, planeMeta } = sim;
+  planeDepth.fill(0);
+  const planeLayers = getPlaneLayers(draw);
+  const activeIds = resolveActivePlaneIds(sim, draw);
+  const activeSet = new Set<number>();
+  activeIds.forEach((planeId, order) => {
+    const layer = planeLayers.find((pl) => pl.planeId === planeId);
+    if (!layer) return;
+    let meta = planeMeta.get(planeId);
+    meta = computePlaneMetadata(sim, planeId, layer.points, meta) ?? meta;
+    if (!meta) return;
+    ensurePlaneMetadataDefaults(meta);
+    meta.order = order;
+    planeMeta.set(planeId, meta);
+    const cells = meta.cells;
+    for (let idx = 0; idx < cells.length; idx++) {
+      const cell = cells[idx];
+      planeDepth[cell] = clamp(planeDepth[cell] + 1, 0, 255);
+    }
+    activeSet.add(planeId);
+  });
+  sim.activePlaneIds = activeIds;
+  sim.activePlaneSet = activeSet;
+  updateMasks(sim);
+  markDagDirty(sim);
+}
+
 export function rebuildWallFromLayers(
   sim: SimulationState,
   draw: DrawingState,
@@ -81,6 +211,7 @@ export function rebuildWallFromLayers(
         depositLineSegmentToWall(sim, layer.points[t - 1], layer.points[t], pixelSize, lineWidth, layer.lineWidth);
       }
     } else if (layer.kind === "plane") {
+      if (!sim.activePlaneSet.has(layer.planeId)) continue;
       const pts = layer.points;
       if (pts.length > 1) {
         for (let t = 1; t < pts.length; t++) {
@@ -100,49 +231,13 @@ export function addPlaneFromStroke(
   draw: DrawingState,
   points: Point[],
   lineWidth: number,
+  pixelSize: number,
+  emBlur: number,
 ) {
-  const { W, H, planeDepth, planeMeta } = sim;
+  const { planeMeta } = sim;
   const id = draw.nextPlaneId++;
-  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
-  for (const p of points) {
-    minx = Math.min(minx, p.x);
-    miny = Math.min(miny, p.y);
-    maxx = Math.max(maxx, p.x);
-    maxy = Math.max(maxy, p.y);
-  }
-  minx = Math.floor(clamp(minx, 0, W - 1));
-  maxx = Math.floor(clamp(maxx, 0, W - 1));
-  miny = Math.floor(clamp(miny, 0, H - 1));
-  maxy = Math.floor(clamp(maxy, 0, H - 1));
-
-  const cells: number[] = [];
-  for (let y = miny; y <= maxy; y++) {
-    for (let x = minx; x <= maxx; x++) {
-      if (pnpoly(points, x + 0.5, y + 0.5)) {
-        const k = y * W + x;
-        cells.push(k);
-        planeDepth[k] = clamp(planeDepth[k] + 1, 0, 255);
-      }
-    }
-  }
-  if (cells.length === 0) return;
-
-  const cx = points.reduce((a, p) => a + p.x, 0) / points.length;
-  const cy = points.reduce((a, p) => a + p.y, 0) / points.length;
-  const signedArea = polygonSignedArea(points);
-  const orientationSign = signedArea === 0 ? 0 : signedArea > 0 ? 1 : -1;
-  const orientation = orientationSign === 0 ? "flat" : orientationSign > 0 ? "ccw" : "cw";
-  const hue = (id * 0.123) % 1;
-  const color = hsvToRgb(hue, 0.7, 1.0);
-  const metadata = {
-    cells: Int32Array.from(cells),
-    R: 0,
-    psi: 0,
-    color,
-    centroid: { x: cx, y: cy },
-    orientation,
-    orientationSign,
-  };
+  const metadata = computePlaneMetadata(sim, id, points);
+  if (!metadata) return;
   planeMeta.set(id, metadata);
 
   const planeLayer: PlaneLayer = {
@@ -150,14 +245,15 @@ export function addPlaneFromStroke(
     kind: "plane",
     planeId: id,
     points: [...points],
-    centroid: { x: cx, y: cy },
-    orientation,
-    orientationSign,
+    centroid: { ...metadata.centroid },
+    orientation: metadata.orientation,
+    orientationSign: metadata.orientationSign,
     outlineWidth: lineWidth,
   };
   draw.layers.push(planeLayer);
-  updateMasks(sim);
-  markDagDirty(sim);
+  draw.selectedPlaneIds = [id];
+  recomputePlaneDepthFromLayers(sim, draw);
+  rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
 }
 
 export function removeLastPlane(
@@ -167,21 +263,14 @@ export function removeLastPlane(
   lineWidth: number,
   emBlur: number,
 ) {
-  const { planeDepth, planeMeta } = sim;
+  const { planeMeta } = sim;
   for (let i = draw.layers.length - 1; i >= 0; i--) {
     const layer = draw.layers[i];
     if (layer.kind !== "plane") continue;
     draw.layers.splice(i, 1);
-    const meta = planeMeta.get(layer.planeId);
-    if (meta) {
-      for (let idx = 0; idx < meta.cells.length; idx++) {
-        const cell = meta.cells[idx];
-        planeDepth[cell] = Math.max(0, planeDepth[cell] - 1);
-      }
-      planeMeta.delete(layer.planeId);
-    }
-    updateMasks(sim);
-    markDagDirty(sim);
+    planeMeta.delete(layer.planeId);
+    draw.selectedPlaneIds = draw.selectedPlaneIds.filter((id) => id !== layer.planeId);
+    recomputePlaneDepthFromLayers(sim, draw);
     rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
     return;
   }
@@ -194,14 +283,12 @@ export function clearPlanes(
   lineWidth: number,
   emBlur: number,
 ) {
-  const { planeDepth, planeMeta, surfMask, hypMask } = sim;
-  planeDepth.fill(0);
+  const { planeMeta } = sim;
   planeMeta.clear();
-  surfMask.fill(0);
-  hypMask.fill(0);
   draw.layers = draw.layers.filter((layer) => layer.kind !== "plane");
   draw.nextPlaneId = 1;
-  markDagDirty(sim);
+  draw.selectedPlaneIds = [];
+  recomputePlaneDepthFromLayers(sim, draw);
   rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
 }
 
@@ -335,4 +422,107 @@ export function updateImageOutlineWidth(
   if (needsRebuild) {
     rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
   }
+}
+
+export function addStrokeLayer(
+  sim: SimulationState,
+  draw: DrawingState,
+  points: Point[],
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+) {
+  const strokeLayer: StrokeLayer = {
+    id: draw.nextLayerId++,
+    kind: "stroke",
+    points: [...points],
+    lineWidth,
+  };
+  draw.layers.push(strokeLayer);
+  rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
+}
+
+export function setPlaneSelection(draw: DrawingState, planeIds: number[]) {
+  draw.selectedPlaneIds = [...planeIds];
+}
+
+function getPlaneMetadata(sim: SimulationState, planeId: number): PlaneMetadata | null {
+  const meta = sim.planeMeta.get(planeId);
+  if (!meta) return null;
+  return ensurePlaneMetadataDefaults(meta);
+}
+
+export function setPlaneSolo(sim: SimulationState, planeId: number, value: boolean): boolean {
+  const meta = getPlaneMetadata(sim, planeId);
+  if (!meta) return false;
+  if (meta.locked && !meta.solo && value === true) {
+    return false;
+  }
+  if (meta.solo === value) return false;
+  meta.solo = value;
+  if (value) meta.muted = false;
+  return true;
+}
+
+export function setPlaneMuted(sim: SimulationState, planeId: number, value: boolean): boolean {
+  const meta = getPlaneMetadata(sim, planeId);
+  if (!meta) return false;
+  if (meta.locked && value && !meta.muted) {
+    return false;
+  }
+  if (meta.muted === value) return false;
+  meta.muted = value;
+  if (value) meta.solo = false;
+  return true;
+}
+
+export function setPlaneLocked(sim: SimulationState, planeId: number, value: boolean): boolean {
+  const meta = getPlaneMetadata(sim, planeId);
+  if (!meta) return false;
+  if (meta.locked === value) return false;
+  meta.locked = value;
+  return true;
+}
+
+export function reorderPlaneLayer(
+  sim: SimulationState,
+  draw: DrawingState,
+  sourcePlaneId: number,
+  targetPlaneId: number | null,
+): boolean {
+  const sourceIndex = draw.layers.findIndex(
+    (layer) => layer.kind === "plane" && layer.planeId === sourcePlaneId,
+  );
+  if (sourceIndex < 0) return false;
+  const sourceMeta = getPlaneMetadata(sim, sourcePlaneId);
+  if (sourceMeta?.locked) return false;
+  const targetIndex =
+    targetPlaneId === null
+      ? draw.layers.length
+      : draw.layers.findIndex((layer) => layer.kind === "plane" && layer.planeId === targetPlaneId);
+  if (targetPlaneId !== null && targetIndex < 0) return false;
+  if (targetPlaneId !== null && sourcePlaneId === targetPlaneId) return false;
+  const targetInsertIndex =
+    targetPlaneId === null
+      ? draw.layers.length
+      : targetIndex;
+  const [layer] = draw.layers.splice(sourceIndex, 1);
+  let insertIndex = targetInsertIndex;
+  if (targetPlaneId !== null && sourceIndex < targetInsertIndex) {
+    insertIndex -= 1;
+  }
+  draw.layers.splice(insertIndex, 0, layer);
+  return true;
+}
+
+export function createDrawingState(): DrawingState {
+  return {
+    drawing: false,
+    currentStroke: [],
+    layers: [],
+    nextPlaneId: 1,
+    nextLayerId: 1,
+    draggingImage: null,
+    selectedPlaneIds: [],
+  };
 }
