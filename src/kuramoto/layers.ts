@@ -1,3 +1,4 @@
+import { booleanCombine, flipPoints, rotatePoints90, skewPoints, smoothPoints, ensureWinding } from "./geometry";
 import { clamp, hsvToRgb, pnpoly, polygonSignedArea } from "./math";
 import { recomputePotential, markDagDirty, updateMasks } from "./simulation";
 import {
@@ -74,7 +75,7 @@ function ensurePlaneMetadataDefaults(meta: PlaneMetadata) {
   return meta;
 }
 
-function computePlaneMetadata(
+export function computePlaneMetadata(
   sim: SimulationState,
   planeId: number,
   points: Point[],
@@ -137,6 +138,146 @@ function computePlaneMetadata(
 
 function getPlaneLayers(draw: DrawingState) {
   return draw.layers.filter((layer): layer is PlaneLayer => layer.kind === "plane");
+}
+
+export function getPlaneLayer(draw: DrawingState, planeId: number): PlaneLayer | null {
+  for (let i = 0; i < draw.layers.length; i++) {
+    const layer = draw.layers[i];
+    if (layer.kind === "plane" && layer.planeId === planeId) {
+      return layer;
+    }
+  }
+  return null;
+}
+
+export function computePlaneBounds(points: Point[]) {
+  if (points.length === 0) {
+    return {
+      minX: 0,
+      maxX: 0,
+      minY: 0,
+      maxY: 0,
+      width: 0,
+      height: 0,
+      center: { x: 0, y: 0 },
+    };
+  }
+  let minX = points[0].x;
+  let maxX = points[0].x;
+  let minY = points[0].y;
+  let maxY = points[0].y;
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i];
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const center = { x: minX + width / 2, y: minY + height / 2 };
+  return { minX, maxX, minY, maxY, width, height, center };
+}
+
+export function getPlaneOrder(draw: DrawingState): number[] {
+  const order: number[] = [];
+  for (let i = 0; i < draw.layers.length; i++) {
+    const layer = draw.layers[i];
+    if (layer.kind === "plane") {
+      order.push(layer.planeId);
+    }
+  }
+  return order;
+}
+
+export function applyPlaneOrder(
+  sim: SimulationState,
+  draw: DrawingState,
+  order: number[],
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+): boolean {
+  const current = getPlaneOrder(draw);
+  if (order.length === 0 || current.length === 0) return false;
+  let identical = current.length === order.length;
+  if (identical) {
+    for (let i = 0; i < current.length; i++) {
+      if (current[i] !== order[i]) {
+        identical = false;
+        break;
+      }
+    }
+  }
+  if (identical) return false;
+  const planeLayers = new Map<number, PlaneLayer>();
+  const fallback: number[] = [];
+  for (let i = 0; i < draw.layers.length; i++) {
+    const layer = draw.layers[i];
+    if (layer.kind === "plane") {
+      planeLayers.set(layer.planeId, layer);
+    }
+  }
+  const normalized: number[] = [];
+  const seen = new Set<number>();
+  order.forEach((id) => {
+    if (!seen.has(id) && planeLayers.has(id)) {
+      normalized.push(id);
+      seen.add(id);
+    }
+  });
+  current.forEach((id) => {
+    if (!seen.has(id)) {
+      normalized.push(id);
+      seen.add(id);
+    }
+  });
+  if (normalized.length !== current.length) return false;
+
+  const planePositions: number[] = [];
+  for (let i = 0; i < draw.layers.length; i++) {
+    if (draw.layers[i].kind === "plane") {
+      planePositions.push(i);
+    }
+  }
+  if (planePositions.length !== normalized.length) return false;
+
+  const updatedLayers = draw.layers.slice();
+  for (let idx = 0; idx < planePositions.length; idx++) {
+    const targetPlaneId = normalized[idx];
+    const layer = planeLayers.get(targetPlaneId);
+    if (!layer) continue;
+    updatedLayers[planePositions[idx]] = layer;
+  }
+  draw.layers = updatedLayers;
+  recomputePlaneDepthFromLayers(sim, draw);
+  rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
+  return true;
+}
+
+export function updatePlaneGeometry(
+  sim: SimulationState,
+  draw: DrawingState,
+  planeId: number,
+  newPoints: Point[],
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+): boolean {
+  if (newPoints.length < 3) return false;
+  const planeLayer = getPlaneLayer(draw, planeId);
+  if (!planeLayer) return false;
+  const existingMeta = sim.planeMeta.get(planeId);
+  const metadata = computePlaneMetadata(sim, planeId, newPoints, existingMeta);
+  if (!metadata) return false;
+  planeLayer.points = newPoints.map((p) => ({ x: p.x, y: p.y }));
+  planeLayer.centroid = { ...metadata.centroid };
+  planeLayer.orientation = metadata.orientation;
+  planeLayer.orientationSign = metadata.orientationSign;
+  sim.planeMeta.set(planeId, metadata);
+  recomputePlaneDepthFromLayers(sim, draw);
+  rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
+  return true;
 }
 
 function resolveActivePlaneIds(sim: SimulationState, draw: DrawingState): number[] {
@@ -515,6 +656,187 @@ export function reorderPlaneLayer(
   return true;
 }
 
+function clonePoints(points: Point[]): Point[] {
+  return points.map((p) => ({ x: p.x, y: p.y }));
+}
+
+function sanitizePoints(sim: SimulationState, points: Point[]): Point[] {
+  const { W, H } = sim;
+  const sanitized: Point[] = [];
+  const eps = 1e-3;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const x = clamp(p.x, 0, W - 1e-3);
+    const y = clamp(p.y, 0, H - 1e-3);
+    const px = Number.parseFloat(x.toFixed(4));
+    const py = Number.parseFloat(y.toFixed(4));
+    const prev = sanitized[sanitized.length - 1];
+    if (!prev || Math.hypot(prev.x - px, prev.y - py) > eps) {
+      sanitized.push({ x: px, y: py });
+    }
+  }
+  if (sanitized.length >= 3) {
+    const first = sanitized[0];
+    const last = sanitized[sanitized.length - 1];
+    if (Math.hypot(first.x - last.x, first.y - last.y) <= eps) {
+      sanitized.pop();
+    }
+  }
+  return sanitized.length >= 3 ? sanitized : points;
+}
+
+export function deletePlanes(
+  sim: SimulationState,
+  draw: DrawingState,
+  planeIds: number[],
+  mode: "keep-wall" | "keep-energy" | "clean",
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+  energyBaseline: number,
+) {
+  if (planeIds.length === 0) return false;
+  const planeSet = new Set(planeIds);
+  let changed = false;
+  const outlineStrokes: StrokeLayer[] = [];
+  const affectedCells: number[] = [];
+
+  for (let i = draw.layers.length - 1; i >= 0; i--) {
+    const layer = draw.layers[i];
+    if (layer.kind !== "plane") continue;
+    if (!planeSet.has(layer.planeId)) continue;
+    changed = true;
+    const meta = sim.planeMeta.get(layer.planeId);
+    if (meta) {
+      for (let c = 0; c < meta.cells.length; c++) {
+        affectedCells.push(meta.cells[c]);
+      }
+    }
+    sim.planeMeta.delete(layer.planeId);
+    draw.selectedPlaneIds = draw.selectedPlaneIds.filter((id) => id !== layer.planeId);
+    draw.layers.splice(i, 1);
+    if (mode === "keep-wall") {
+      const outlinePoints = clonePoints(layer.points);
+      if (outlinePoints.length > 0) {
+        outlinePoints.push({ ...outlinePoints[0] });
+      }
+      const strokeLayer: StrokeLayer = {
+        id: draw.nextLayerId++,
+        kind: "stroke",
+        points: outlinePoints,
+        lineWidth: Math.max(1, layer.outlineWidth || lineWidth),
+      };
+      outlineStrokes.push(strokeLayer);
+    }
+  }
+
+  if (!changed) return false;
+
+  if (outlineStrokes.length > 0) {
+    outlineStrokes.reverse().forEach((stroke) => {
+      draw.layers.push(stroke);
+    });
+  }
+
+  if (mode === "clean" && affectedCells.length > 0) {
+    const { energy } = sim;
+    for (let c = 0; c < affectedCells.length; c++) {
+      energy[affectedCells[c]] = energyBaseline;
+    }
+  }
+
+  recomputePlaneDepthFromLayers(sim, draw);
+  rebuildWallFromLayers(sim, draw, pixelSize, lineWidth, emBlur);
+  return true;
+}
+
+export type PlaneTransformAction =
+  | "flip-horizontal"
+  | "flip-vertical"
+  | "rotate-cw"
+  | "rotate-ccw"
+  | "skew-x-pos"
+  | "skew-x-neg"
+  | "skew-y-pos"
+  | "skew-y-neg"
+  | "smooth";
+
+export type PlaneBooleanAction = "union" | "subtract" | "intersect";
+
+export function transformPlaneShape(
+  sim: SimulationState,
+  draw: DrawingState,
+  planeId: number,
+  action: PlaneTransformAction,
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+): boolean {
+  const layer = getPlaneLayer(draw, planeId);
+  if (!layer) return false;
+  let nextPoints: Point[] = clonePoints(layer.points);
+  switch (action) {
+    case "flip-horizontal":
+      nextPoints = flipPoints(nextPoints, "horizontal");
+      break;
+    case "flip-vertical":
+      nextPoints = flipPoints(nextPoints, "vertical");
+      break;
+    case "rotate-cw":
+      nextPoints = rotatePoints90(nextPoints, "cw");
+      break;
+    case "rotate-ccw":
+      nextPoints = rotatePoints90(nextPoints, "ccw");
+      break;
+    case "skew-x-pos":
+      nextPoints = skewPoints(nextPoints, "x", 0.35);
+      break;
+    case "skew-x-neg":
+      nextPoints = skewPoints(nextPoints, "x", -0.35);
+      break;
+    case "skew-y-pos":
+      nextPoints = skewPoints(nextPoints, "y", 0.35);
+      break;
+    case "skew-y-neg":
+      nextPoints = skewPoints(nextPoints, "y", -0.35);
+      break;
+    case "smooth":
+      nextPoints = smoothPoints(nextPoints, 2);
+      break;
+  }
+  nextPoints = ensureWinding(sanitizePoints(sim, nextPoints));
+  if (nextPoints.length < 3) return false;
+  return updatePlaneGeometry(sim, draw, planeId, nextPoints, pixelSize, lineWidth, emBlur);
+}
+
+export function booleanCombinePlanes(
+  sim: SimulationState,
+  draw: DrawingState,
+  basePlaneId: number,
+  otherPlaneIds: number[],
+  action: PlaneBooleanAction,
+  pixelSize: number,
+  lineWidth: number,
+  emBlur: number,
+): boolean {
+  const baseLayer = getPlaneLayer(draw, basePlaneId);
+  if (!baseLayer) return false;
+  const others: Point[][] = [];
+  const planeSet = new Set(otherPlaneIds);
+  draw.layers.forEach((layer) => {
+    if (layer.kind !== "plane") return;
+    if (!planeSet.has(layer.planeId)) return;
+    others.push(clonePoints(layer.points));
+  });
+  if (others.length === 0) return false;
+  const mode = action === "union" ? "union" : action === "intersect" ? "intersect" : "subtract";
+  const combined = booleanCombine(mode, clonePoints(baseLayer.points), others);
+  if (combined.length < 3) return false;
+  const sanitized = ensureWinding(sanitizePoints(sim, combined));
+  if (sanitized.length < 3) return false;
+  return updatePlaneGeometry(sim, draw, basePlaneId, sanitized, pixelSize, lineWidth, emBlur);
+}
+
 export function createDrawingState(): DrawingState {
   return {
     drawing: false,
@@ -524,5 +846,9 @@ export function createDrawingState(): DrawingState {
     nextLayerId: 1,
     draggingImage: null,
     selectedPlaneIds: [],
+    planeTransformSession: null,
+    planeTransformHover: null,
+    planeOrderUndo: [],
+    planeOrderRedo: [],
   };
 }

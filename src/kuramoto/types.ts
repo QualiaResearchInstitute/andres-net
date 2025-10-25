@@ -39,6 +39,35 @@ export type DragImageState =
     }
   | null;
 
+export type TransformHandleType =
+  | "move"
+  | "scale-n"
+  | "scale-ne"
+  | "scale-e"
+  | "scale-se"
+  | "scale-s"
+  | "scale-sw"
+  | "scale-w"
+  | "scale-nw"
+  | "rotate";
+
+export type PlaneTransformHover = {
+  planeId: number;
+  handle: TransformHandleType;
+} | null;
+
+export type PlaneTransformSession = {
+  planeId: number;
+  handle: TransformHandleType;
+  initialPointer: Point;
+  initialHandlePosition: Point;
+  initialPoints: Point[];
+  initialBounds: { minX: number; maxX: number; minY: number; maxY: number };
+  initialCenter: Point;
+  initialRotationAngle?: number;
+  dirty: boolean;
+};
+
 export type PlaneMetadata = {
   cells: Int32Array;
   R: number;
@@ -77,6 +106,10 @@ export type DrawingState = {
   nextLayerId: number;
   draggingImage: DragImageState;
   selectedPlaneIds: number[];
+  planeTransformSession: PlaneTransformSession | null;
+  planeTransformHover: PlaneTransformHover;
+  planeOrderUndo: number[][];
+  planeOrderRedo: number[][];
 };
 
 export type SimulationState = {
@@ -108,4 +141,5 @@ export type SimulationState = {
   reseedKey: number;
   activePlaneIds: number[];
   activePlaneSet: Set<number>;
+  noiseSeed: number;
 };

@@ -210,6 +210,8 @@ export function createSimulation(prev: SimulationState | null, config: Simulatio
       prev && prev.N === N && !fullReset && prev.activePlaneIds
         ? new Set(prev.activePlaneIds)
         : new Set<number>(),
+    noiseSeed:
+      prev && prev.N === N && !fullReset ? prev.noiseSeed : 0x9e3779b9 ^ (W << 5) ^ (H << 11) ^ (reseedGraphKey << 17),
   };
 
   const shouldResetDrawing = !prev || fullReset || prev.N !== N;
@@ -317,4 +319,19 @@ export function resetPhases(sim: SimulationState) {
 export function clearWalls(sim: SimulationState) {
   sim.wall.fill(0);
   sim.pot.fill(0);
+}
+
+export function setNoiseSeed(sim: SimulationState, seed: number) {
+  const normalized = (seed | 0) || 123456789;
+  sim.noiseSeed = normalized;
+}
+
+export function nextNoise(sim: SimulationState) {
+  let x = sim.noiseSeed | 0;
+  if (x === 0) x = 123456789;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  sim.noiseSeed = x;
+  return (x >>> 0) / 0xffffffff;
 }

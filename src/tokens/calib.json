@@ -1,0 +1,9 @@
+{
+  "schema": "ridge-calib-v1",
+  "Aact": { "scale": 1.0, "bias": 0.0 },
+  "Uact": { "scale": 1.0, "bias": 0.0 },
+  "provenance": {
+    "note": "Identity calibration placeholder. Replace with offline ridge fit to tighten RMSE.",
+    "updatedAt": 0
+  }
+}

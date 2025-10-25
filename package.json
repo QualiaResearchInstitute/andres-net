@@ -6,17 +6,28 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:watch": "vitest",
+    "test:ci": "vitest run --reporter=basic",
+    "update:golden": "UPDATE_GOLDEN=1 vitest run -t 'golden scenes'",
+    "build:scripts": "tsc -p tsconfig.scripts.json",
+    "export:pat": "npm run build:scripts && node dist-scripts/scripts/export_pat_dataset.js"
   },
   "dependencies": {
+    "cbor-x": "^1.6.0",
+    "martinez-polygon-clipping": "^0.7.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@types/node": "^22.7.4",
     "@types/react": "^18.3.8",
     "@types/react-dom": "^18.3.3",
     "@vitejs/plugin-react": "^4.3.3",
     "typescript": "^5.6.3",
-    "vite": "^5.4.9"
+    "vite": "^5.4.9",
+    "vitest": "^1.6.0"
   }
 }

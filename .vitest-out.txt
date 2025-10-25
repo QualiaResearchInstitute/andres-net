@@ -1,0 +1,18 @@
+
+ RUN  v1.6.1 /Users/huntermeyer/tw
+
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > kappaSchedule decreases with t and stays positive
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > parzenScore is zero when all neighbors equal self angle
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > reverseFlowStep wraps angles to (-π, π]
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > buildPatchesFromNeighbors returns normalized weights (~1)
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > localOrderParameter stays within [0,1]
+ ✓ src/kuramoto/sampler.test.ts > reverseSampler utilities > defectDensityEstimate returns non-negative density within [0, 1]
+ ✓ src/kuramoto/attention.test.ts > attention/updateAttentionFields > is deterministic given the same initial sim state and params
+ ✓ src/kuramoto/attention.test.ts > attention/updateAttentionFields > reflectorGain>0 changes A compared to reflectorGain=0 (with ReflectorGraph attached)
+ ✓ src/kuramoto/determinism.test.ts > Simulation determinism (noise-free) > produces identical phases across two identical runs
+
+ Test Files  3 passed (3)
+      Tests  9 passed (9)
+   Start at  13:35:26
+   Duration  199ms (transform 95ms, setup 0ms, collect 135ms, tests 53ms, environment 0ms, prepare 129ms)
+
