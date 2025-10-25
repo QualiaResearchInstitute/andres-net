@@ -27,6 +27,8 @@ export type AttentionParams = {
   betaAlpha: number;
   gammaD: number;
   deltaD: number;
+  // Optional wind advection gain (guarded, default 0 via engine)
+  etaV?: number;
   // Salience weights
   wGrad: number;
   wLap: number;
@@ -46,8 +48,10 @@ export type AttentionOutputs = {
   U: Float32Array;
   Aact: Float32Array; // σ(A)
   Uact: Float32Array; // σ(U)
-  lapA: Float32Array; // ΔA (swirl proxy)
+  lapA: Float32Array; // orientation-aware payload used by gammaAlpha
   divU: Float32Array; // ΔU (divergence proxy)
+  lapAraw: Float32Array; // raw ΔA
+  advect: Float32Array; // ∇A ⋅ ∇θ
 };
 
 const sigma = (x: number) => Math.tanh(x);
@@ -372,29 +376,30 @@ export function updateAttentionFields(
     const lamMax = 0.5 * (t + d);
     const lamMin = 0.5 * (t - d);
 
-    // dominant eigenvector (closed-form for 2x2)
-    let vx: number, vy: number;
-    if (Math.abs(b) > 1e-6) {
-      vx = lamMax - c;
-      vy = b;
-    } else {
-      // near-diagonal tensor: default to x-axis
-      vx = 1.0;
-      vy = 0.0;
-    }
-    const norm = Math.hypot(vx, vy) || 1.0;
-    const vxn = vx / norm;
-    const vyn = vy / norm;
+    // Numeric safety near isotropy: robust eigenvector and coherence
+    const vx0 = Math.abs(b) > 1e-8 ? (lamMax - c) : 1.0;
+    const vy0 = Math.abs(b) > 1e-8 ? b : 0.0;
+    const norm = Math.max(1e-8, Math.hypot(vx0, vy0));
+    const vxn = vx0 / norm;
+    const vyn = vy0 / norm;
 
-    // coherence χ in [0, 1)
-    const chi = (lamMax - lamMin) / (lamMax + lamMin + 1e-6);
+    // coherence χ in [0,1] with denom floor; fade out in weak-orientation regions
+    const denom = Math.max(lamMax + lamMin, 1e-8);
+    const chi = Math.max(0, Math.min(1, (lamMax - lamMin) / denom));
+    const chiEff = chi < 0.05 ? 0 : chi;
 
     // ∇⊥A = (-Ay, Ax); swirl = ∇⊥A ⋅ v_max
     const swirl = (-Ay[i]) * vxn + (Ax[i]) * vyn;
 
     // final orientation-aware payload (dimensionless): stepSimulation multiplies by gammaAlpha
-    lapA2[i] = chi * swirl;
+    lapA2[i] = chiEff * swirl;
   }
 
-  return { A, U, Aact, Uact, lapA: lapA2, divU: lapU2 };
+  // Wind advection scalar: ∇A ⋅ ∇θ
+  const advect = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    advect[i] = Ax[i] * phix[i] + Ay[i] * phiy[i];
+  }
+
+  return { A, U, Aact, Uact, lapA: lapA2, divU: lapU2, lapAraw: lapA, advect };
 }

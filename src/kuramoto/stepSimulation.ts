@@ -7,6 +7,13 @@ export type AttentionMods = {
   Uact: Float32Array;
   lapA: Float32Array;
   divU: Float32Array;
+  // Optional raw A field, raw Laplacian of A, and wind advection scalar
+  A?: Float32Array;
+  lapAraw?: Float32Array;
+  advect?: Float32Array;
+  // Wind advection gain (guarded)
+  etaV?: number;
+  // Modulator gains
   gammaK: number;
   betaK: number;
   gammaAlpha: number;
@@ -52,6 +59,9 @@ export type StepConfig = {
   dagLogStats: boolean;
   attentionMods?: AttentionMods;
   horizonFactor: (iInside: boolean, jInside: boolean, receiverInside: boolean) => number;
+  // Optional per-index policies (backward-compatible if omitted)
+  horizonPair?: (i: number, j: number) => number; // attenuation across i↔j (0..1), overrides horizonFactor
+  KpairBoost?: (i: number, j: number) => number;  // multiplicative boost to coupling when applicable
 };
 
 export function stepSimulation(sim: SimulationState, config: StepConfig) {
@@ -92,6 +102,8 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
     dagLogStats,
     horizonFactor,
     attentionMods,
+    horizonPair,
+    KpairBoost,
   } = config;
 
   const {
@@ -215,18 +227,19 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           const w = band === 1 ? K1 : band === 2 ? K2 : K3;
           if (w === 0) continue;
           const jIn = !!surfMask[j];
-          const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
-          const horizon = horizonFactor(iIn, jIn, iIn);
-          {
-            let wEff = w;
-            let alphaBias = 0;
-            if (attentionMods) {
-              const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
-              wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
-              alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+            const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
+            const horizon = horizonPair ? horizonPair(i, j) : horizonFactor(iIn, jIn, iIn);
+            {
+              let wEff = w;
+              let alphaBias = 0;
+              if (attentionMods) {
+                const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = attentionMods;
+                wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+                alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+              }
+              if (KpairBoost) { wEff *= KpairBoost(i, j); }
+              sum += barrierH * horizon * wEff * Math.sin(phases[j] - th - alphaBias);
             }
-            sum += barrierH * horizon * wEff * Math.sin(phases[j] - th - alphaBias);
-          }
         }
         const sw = swEdges[i] as Array<[number, number]>;
         for (let k = 0; k < sw.length; k++) {
@@ -234,7 +247,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           const w = swWeight * sign;
           const jIn = !!surfMask[j];
           const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
-          const horizon = horizonFactor(iIn, jIn, iIn);
+          const horizon = horizonPair ? horizonPair(i, j) : horizonFactor(iIn, jIn, iIn);
           {
             let wEff = w;
             let alphaBias = 0;
@@ -243,6 +256,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
               wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
               alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
             }
+            if (KpairBoost) { wEff *= KpairBoost(i, j); }
             sum += barrierH * horizon * wEff * Math.sin(phases[j] - th - alphaBias);
           }
         }
@@ -250,7 +264,11 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
         if (surfMask[i]) sumSurf = alphaSurfToField * Math.sin(surfPhi[i] - th);
         let sumHyp = 0;
         if (hypMask[i]) sumHyp = alphaHypToField * Math.sin(hypPhi[i] - th);
-        const dtheta = (omegas[i] + Kbase * sum + sumSurf + sumHyp) * dt;
+        let extraVel = 0;
+        if (attentionMods && attentionMods.etaV && attentionMods.advect) {
+          extraVel = attentionMods.etaV * attentionMods.advect[i];
+        }
+        const dtheta = (omegas[i] + Kbase * sum + sumSurf + sumHyp + extraVel) * dt;
         nextPhases[i] = (th + dtheta) % TAU;
         if (nextPhases[i] < 0) nextPhases[i] += TAU;
       }
@@ -283,7 +301,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
             if (w === 0) continue;
             const jIn = !!surfMask[j];
             const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
-            const horizon = horizonFactor(iIn, jIn, iIn);
+            const horizon = horizonPair ? horizonPair(i, j) : horizonFactor(iIn, jIn, iIn);
             const source = depthOrdered ? (depthMask >= 0 ? snapshot[j] : phases[j]) : phases[j];
             {
               let wEff = w;
@@ -293,6 +311,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
                 wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
                 alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
               }
+              if (KpairBoost) { wEff *= KpairBoost(i, j); }
               sum += barrierH * horizon * wEff * Math.sin(source - th - alphaBias);
             }
           }
@@ -302,7 +321,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
             const w = swWeight * sign;
             const jIn = !!surfMask[j];
             const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
-            const horizon = horizonFactor(iIn, jIn, iIn);
+            const horizon = horizonPair ? horizonPair(i, j) : horizonFactor(iIn, jIn, iIn);
             const source = depthOrdered ? (depthMask >= 0 ? snapshot[j] : phases[j]) : phases[j];
             {
               let wEff = w;
@@ -312,6 +331,7 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
                 wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
                 alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
               }
+              if (KpairBoost) { wEff *= KpairBoost(i, j); }
               sum += barrierH * horizon * wEff * Math.sin(source - th - alphaBias);
             }
           }
@@ -319,7 +339,11 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           if (surfMask[i]) sumSurf = alphaSurfToField * Math.sin(surfPhi[i] - th);
           let sumHyp = 0;
           if (hypMask[i]) sumHyp = alphaHypToField * Math.sin(hypPhi[i] - th);
-          const dtheta = (omegas[i] + Kbase * sum + sumSurf + sumHyp) * dt;
+          let extraVel = 0;
+          if (attentionMods && attentionMods.etaV && attentionMods.advect) {
+            extraVel = attentionMods.etaV * attentionMods.advect[i];
+          }
+          const dtheta = (omegas[i] + Kbase * sum + sumSurf + sumHyp + extraVel) * dt;
           phases[i] = (th + dtheta) % TAU;
           if (phases[i] < 0) phases[i] += TAU;
         }
@@ -352,6 +376,24 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
     const sink = sinkLine + (surfMask[i] ? sinkSurf : 0) + (hypMask[i] ? sinkHyp : 0);
     const trap = (surfMask[i] ? trapSurf : 0) + (hypMask[i] ? trapHyp : 0);
     const minEnergy = surfMask[i] ? minEnergySurf : hypMask[i] ? minEnergyHyp : 0;
+
+    // Optional wind energy advection: -div(E ∇A) ≈ -(∇E⋅∇A + E ΔA)
+    let energyAdv = 0;
+    if (attentionMods && attentionMods.etaV && attentionMods.A && attentionMods.lapAraw) {
+      const x_i = i % W;
+      const y_i = Math.floor(i / W);
+      const ixm = idx(x_i - 1, y_i, W, H, wrap);
+      const ixp = idx(x_i + 1, y_i, W, H, wrap);
+      const iym = idx(x_i, y_i - 1, W, H, wrap);
+      const iyp = idx(x_i, y_i + 1, W, H, wrap);
+      const dEx = 0.5 * (energy[ixp] - energy[ixm]);
+      const dEy = 0.5 * (energy[iyp] - energy[iym]);
+      const dAx = 0.5 * (attentionMods.A[ixp] - attentionMods.A[ixm]);
+      const dAy = 0.5 * (attentionMods.A[iyp] - attentionMods.A[iym]);
+      const divEA = dEx * dAx + dEy * dAy + energy[i] * attentionMods.lapAraw[i];
+      energyAdv = -attentionMods.etaV * divEA;
+    }
+
     let nextE =
       energy[i] +
       dt *
@@ -359,7 +401,8 @@ export function stepSimulation(sim: SimulationState, config: StepConfig) {
           emGain * pot[i] +
           energyDiff * (surfDiff + 0.5 * hypDiff) -
           sink * energy[i] +
-          trap * (Math.max(minEnergy, energy[i]) - energy[i]));
+          trap * (Math.max(minEnergy, energy[i]) - energy[i]) +
+          energyAdv);
     nextE = clamp(nextE, minEnergy, 4);
     nextEnergy[i] = nextE;
   }

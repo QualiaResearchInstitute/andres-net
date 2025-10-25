@@ -63,7 +63,16 @@ export function computeDriftTheta(
         const jIn = !!surfMask[j];
         const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
         const horizon = horizonFactor(iIn, jIn, iIn);
-        sum += barrierH * horizon * w * Math.sin(theta[j] - th);
+        {
+          let wEff = w;
+          let alphaBias = 0;
+          if (cfg.attentionMods) {
+            const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = cfg.attentionMods;
+            wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+            alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+          }
+          sum += barrierH * horizon * wEff * Math.sin(theta[j] - th - alphaBias);
+        }
       }
 
       const sw = swEdges[i] as Array<[number, number]>;
@@ -73,7 +82,16 @@ export function computeDriftTheta(
         const jIn = !!surfMask[j];
         const barrierH = 1 - wallBarrier * (Math.max(wall[i], wall[j]) > 0 ? 1 : 0);
         const horizon = horizonFactor(iIn, jIn, iIn);
-        sum += barrierH * horizon * w * Math.sin(theta[j] - th);
+        {
+          let wEff = w;
+          let alphaBias = 0;
+          if (cfg.attentionMods) {
+            const { Aact, Uact, lapA, divU, gammaK, betaK, gammaAlpha, betaAlpha } = cfg.attentionMods;
+            wEff = w * (1 + gammaK * Aact[i] * Aact[j] - betaK * Uact[i] * Uact[j]);
+            alphaBias = gammaAlpha * lapA[i] - betaAlpha * divU[i];
+          }
+          sum += barrierH * horizon * wEff * Math.sin(theta[j] - th - alphaBias);
+        }
       }
 
       let sumSurf = 0;
@@ -81,8 +99,12 @@ export function computeDriftTheta(
       let sumHyp = 0;
       if (hypMask[i]) sumHyp = alphaHypToField * Math.sin(hypPhi[i] - th);
 
-      // dtheta/dt = omegas + couplings
-      out[i] = omegas[i] + Kbase * sum + sumSurf + sumHyp;
+      // dtheta/dt = omegas + couplings (+ optional attention wind advection)
+      let extraVel = 0;
+      if (cfg.attentionMods && cfg.attentionMods.etaV && cfg.attentionMods.advect) {
+        extraVel = cfg.attentionMods.etaV * cfg.attentionMods.advect[i];
+      }
+      out[i] = omegas[i] + Kbase * sum + sumSurf + sumHyp + extraVel;
     }
   }
 
@@ -98,13 +120,20 @@ export function reverseStepInPlace(
   sim: SimulationState,
   cfg: StepConfig,
   t: number = 0.5,
+  opts?: { D?: (t: number) => number },
 ) {
   const N = sim.N;
   const patches = buildPatchesFromNeighbors(sim);
   const Dconst = Math.max(1e-5, cfg.noiseAmp || 0.1);
 
   const drift = (th: Float32Array, _t: number) => computeDriftTheta(th, sim, cfg);
-  const D = (_t: number) => Dconst;
+  const D = (tt: number) => {
+    if (opts && typeof opts.D === "function") {
+      const v = opts.D(tt);
+      return Math.max(0, Number.isFinite(v) ? v : 0);
+    }
+    return Dconst;
+  };
   const score = (th: Float32Array, tt: number) => parzenScore(th, patches, tt);
 
   const next = reverseFlowStep(sim.phases, drift, D, score, t, cfg.dt);

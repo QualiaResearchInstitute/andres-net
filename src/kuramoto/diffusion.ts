@@ -1,3 +1,7 @@
+import type { SimulationState } from "./types";
+import { stepSimulation, type StepConfig } from "./stepSimulation";
+import { reverseStepInPlace } from "./reverseRunner";
+
 export type Schedules = {
   K: (t: number) => number;
   Kref: (t: number) => number;
@@ -50,6 +54,65 @@ export function forwardStep(
 }
 
 /** Example schedule factory */
+export function runForward(
+  sim: SimulationState,
+  buildCfg: () => StepConfig,
+  steps: number,
+  sched?: { K: (t: number) => number; D: (t: number) => number },
+  t0 = 0,
+  t1 = 1,
+) {
+  const n = Math.max(1, steps | 0);
+  for (let s = 0; s < n; s++) {
+    const tau = n === 1 ? t1 : t0 + (t1 - t0) * (s / Math.max(1, n - 1));
+    const cfg = buildCfg();
+    if (sched) {
+      cfg.Kbase = sched.K(tau);
+      cfg.noiseAmp = Math.max(0, sched.D(tau));
+    }
+    stepSimulation(sim, cfg);
+  }
+}
+
+export function runReverse(
+  sim: SimulationState,
+  buildCfg: () => StepConfig,
+  steps: number,
+  t: number = 0.5,
+  opts?: {
+    sched?: { K: (t: number) => number; D: (t: number) => number; Kref?: (t: number) => number; psi?: (t: number) => number };
+    t0?: number;
+    t1?: number;
+  },
+) {
+  const n = Math.max(1, steps | 0);
+  for (let s = 0; s < n; s++) {
+    const tau = opts?.sched
+      ? (n === 1 ? (opts.t1 ?? 1) : (opts.t0 ?? 0) + ((opts.t1 ?? 1) - (opts.t0 ?? 0)) * (s / Math.max(1, n - 1)))
+      : t;
+    const cfg = buildCfg();
+    if (opts?.sched) {
+      cfg.Kbase = opts.sched.K(tau);
+    }
+    reverseStepInPlace(sim, cfg, tau, opts?.sched ? { D: opts.sched.D } : undefined);
+  }
+}
+
+export function runFwdRev(
+  sim: SimulationState,
+  buildCfg: () => StepConfig,
+  fwd: { steps: number; sched?: { K: (t: number) => number; D: (t: number) => number } },
+  rev: { steps: number; t?: number; sched?: { K: (t: number) => number; D: (t: number) => number; Kref?: (t: number) => number; psi?: (t: number) => number } },
+) {
+  runForward(sim, buildCfg, fwd.steps, fwd.sched);
+  const rs = rev.sched ?? fwd.sched;
+  if (rs) {
+    runReverse(sim, buildCfg, rev.steps, rev.t ?? 0.5, { sched: rs, t0: 1, t1: 0 });
+  } else {
+    runReverse(sim, buildCfg, rev.steps, rev.t ?? 0.5);
+  }
+}
+
 export function makeSchedules(K0 = 1, Kref0 = 0.5, D0 = 0.1, D1 = 0.5) {
   return {
     K: (t: number) => K0 * Math.pow(1 - t, 2),

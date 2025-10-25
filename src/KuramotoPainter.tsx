@@ -1,16 +1,127 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useKuramotoEngine } from "./kuramoto/useKuramotoEngine";
 import type { PlaneLayerSnapshot } from "./kuramoto/useKuramotoEngine";
 import { Section, Row, Range, Toggle } from "./kuramoto/uiPrimitives";
 import type { PlaneBooleanAction, PlaneTransformAction } from "./kuramoto/layers";
-import { buildFeatureMatrix, quantizeToCodebook, makeToyPatCodebook, computeAffectHeaders, fitRidge, applyRidgeBatch, computeRGBTargets, mse, psnrFromMSE, patReconMSEFromDists } from "./kuramoto/reservoirReadout";
+import { buildFeatureMatrix, quantizeToCodebook, makeToyPatCodebook, fitRidge, applyRidgeBatch, computeRGBTargets, mse, psnrFromMSE, patReconMSEFromDists } from "./kuramoto/reservoirReadout";
 import type { RidgeHead } from "./kuramoto/reservoirReadout";
 import { buildPatchesFromNeighbors } from "./kuramoto/reverseSampler";
+import { computeAffect } from "./kuramoto/affect";
 import { reverseStepInPlace } from "./kuramoto/reverseRunner";
 import type { StepConfig } from "./kuramoto/stepSimulation";
 import { h_phi } from "./kuramoto/controller";
 import type { ControlSchedule } from "./kuramoto/controller";
 import { computeMetrics } from "./kuramoto/eval";
+import { runForward, runReverse, runFwdRev } from "./kuramoto/diffusion";
+import { buildPATokens } from "./tokens/pat";
+import { tokensToAttentionFields } from "./tokens/tokenOnly";
+import { startPATStream } from "./tokens/stream";
+import { updateAttentionFields } from "./kuramoto/attention";
+import { startSceneRecorder, serializeSceneWithSchedules } from "./kuramoto/sceneRecorder";
+import type { AttentionMods } from "./kuramoto/stepSimulation";
+import { ReflectorGraphPanel } from "./kuramoto/graph/ReflectorGraphPanel";
+import { stepValencePolicy } from "./kuramoto/policyValence";
+import { TokenAtlas } from "./panels/TokenAtlas";
+import type { PAToken } from "./tokens/pat";
+
+function SchedulePlot({
+  K,
+  D,
+  Kref,
+  samples = 101,
+  width = 240,
+  height = 80,
+  strokeK = "rgb(56,189,248)", // cyan-400
+  strokeD = "rgb(244,114,182)", // pink-400
+  strokeKref = "rgb(34,197,94)", // green-500
+}: {
+  K: (t: number) => number;
+  D: (t: number) => number;
+  Kref?: (t: number) => number;
+  samples?: number;
+  width?: number;
+  height?: number;
+  strokeK?: string;
+  strokeD?: string;
+  strokeKref?: string;
+}) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
+    // Sample
+    const T = Math.max(2, samples | 0);
+    const Ks: number[] = [];
+    const Ds: number[] = [];
+    const Krs: number[] = [];
+    for (let i = 0; i < T; i++) {
+      const t = i / (T - 1);
+      Ks.push(K(t));
+      Ds.push(D(t));
+      if (Kref) Krs.push(Kref(t));
+    }
+    // Normalize to [0,1] for plotting (each series independently)
+    const minK = Math.min(...Ks);
+    const maxK = Math.max(...Ks);
+    const minD = Math.min(...Ds);
+    const maxD = Math.max(...Ds);
+    const minKr = Krs.length > 0 ? Math.min(...Krs) : 0;
+    const maxKr = Krs.length > 0 ? Math.max(...Krs) : 1;
+    const nrm = (v: number, lo: number, hi: number) => {
+      const d = hi - lo;
+      return d > 1e-12 ? (v - lo) / d : 0.5;
+    };
+    // Axes
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, height - 0.5);
+    ctx.lineTo(width, height - 0.5);
+    ctx.moveTo(0.5, 0);
+    ctx.lineTo(0.5, height);
+    ctx.stroke();
+    // Plot K
+    ctx.strokeStyle = strokeK;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < T; i++) {
+      const x = (i / (T - 1)) * (width - 1);
+      const y = (1 - nrm(Ks[i], minK, maxK)) * (height - 1);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // Plot D
+    ctx.strokeStyle = strokeD;
+    ctx.beginPath();
+    for (let i = 0; i < T; i++) {
+      const x = (i / (T - 1)) * (width - 1);
+      const y = (1 - nrm(Ds[i], minD, maxD)) * (height - 1);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Plot Kref if provided
+    if (Kref && Krs.length === T) {
+      ctx.strokeStyle = strokeKref;
+      ctx.beginPath();
+      for (let i = 0; i < T; i++) {
+        const x = (i / (T - 1)) * (width - 1);
+        const y = (1 - nrm(Krs[i], minKr, maxKr)) * (height - 1);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }, [K, D, Kref, samples, width, height, strokeK, strokeD, strokeKref]);
+  return <canvas ref={ref} className="rounded border border-zinc-800 bg-zinc-900" />;
+}
 
 export default function KuramotoPainter() {
   const [W, setW] = useState(96);
@@ -59,6 +170,11 @@ export default function KuramotoPainter() {
   const [valence, setValence] = useState(0);
   const [targetArousal, setTargetArousal] = useState(0.5);
   const [targetValence, setTargetValence] = useState(0.5);
+  const [valenceControl, setValenceControl] = useState(false);
+  const [arousalBand, setArousalBand] = useState(0.1);
+  const [policyEveryN, setPolicyEveryN] = useState(8);
+  const policySeedRef = useRef(0);
+  const policyFrameRef = useRef(0);
   const [rgbHead, setRgbHead] = useState<RidgeHead | null>(null);
   const [ctrlSched, setCtrlSched] = useState<ControlSchedule | null>(null);
   const [metrics, setMetrics] = useState<{ rhoMean:number; rhoStd:number; defect:number; entropy:number; aniso:number } | null>(null);
@@ -68,6 +184,17 @@ export default function KuramotoPainter() {
   const [patMSE, setPatMSE] = useState<number | null>(null);
   const [patUsage, setPatUsage] = useState<number | null>(null);
   const [patEntropy, setPatEntropy] = useState<number | null>(null);
+  // PAT streaming controls
+  const [patStreamUrl, setPatStreamUrl] = useState("ws://localhost:9090");
+  const [patStreamFps, setPatStreamFps] = useState(5);
+  const [patScale, setPatScale] = useState<32 | 64>(32);
+  const [patStreaming, setPatStreaming] = useState(false);
+  const patStreamRef = useRef<{ stop: () => void; ws: WebSocket } | null>(null);
+  // Token-only attention and TokenAtlas
+  const [tokenOnly, setTokenOnly] = useState(false);
+  const [tokenAtlasLive, setTokenAtlasLive] = useState(false);
+  const [tokenAtlasTokens, setTokenAtlasTokens] = useState<PAToken[] | null>(null);
+  const [tokenAtlasEveryMs, setTokenAtlasEveryMs] = useState(1000);
 
   const [energyBaseline, setEnergyBaseline] = useState(0.35);
   const [energyLeak, setEnergyLeak] = useState(0.02);
@@ -117,6 +244,7 @@ export default function KuramotoPainter() {
   const [att_wE, setAtt_wE] = useState(0.4);
   const [att_wDef, setAtt_wDef] = useState(1.0);
   const [att_contextR, setAtt_contextR] = useState(6);
+  const [att_reflectorGain, setAtt_reflectorGain] = useState(0);
   const [head1, setHead1] = useState({ enabled: true, weight: 0.9, freq: 8, phase: 0, radius: 10, bindPrimaryPlane: true });
   const [head2, setHead2] = useState({ enabled: false, weight: 0.6, freq: 12, phase: 0, radius: 12, bindPrimaryPlane: true });
   const [head3, setHead3] = useState({ enabled: false, weight: 0.4, freq: 6, phase: 0, radius: 14, bindPrimaryPlane: false });
@@ -126,6 +254,17 @@ export default function KuramotoPainter() {
   const [dagDepthOrdering, setDagDepthOrdering] = useState(true);
   const [dagDepthFiltering, setDagDepthFiltering] = useState(true);
   const [dagLogStats, setDagLogStats] = useState(false);
+
+  // Pockets (topological regions) controls
+  const [pocketEnabled, setPocketEnabled] = useState(false);
+  const [pocketWRho, setPocketWRho] = useState(1.0);
+  const [pocketWAttn, setPocketWAttn] = useState(0.0);
+  const [pocketWShear, setPocketWShear] = useState(1.0);
+  const [pocketWDef, setPocketWDef] = useState(0.5);
+  const [pocketThresh, setPocketThresh] = useState(0.6);
+  const [pocketMinArea, setPocketMinArea] = useState(24);
+  const [pocketHorizon, setPocketHorizon] = useState<"sealed" | "oneway" | "none">("sealed");
+  const [pocketKboost, setPocketKboost] = useState(0.2);
 
   const [stereo, setStereo] = useState(false);
   const [ipd, setIpd] = useState(2.0);
@@ -155,9 +294,11 @@ export default function KuramotoPainter() {
       gammaD: att_gammaD, deltaD: att_deltaD,
       wGrad: att_wGrad, wLap: att_wLap, wE: att_wE, wDef: att_wDef,
       contextRadius: att_contextR,
+      reflectorGain: att_reflectorGain,
+      etaV: 0,
       aClamp: 4.0, uClamp: 4.0,
     }),
-    [att_DA, att_DU, att_muA, att_muU, att_lambdaS, att_lambdaC, att_topo, att_gammaK, att_betaK, att_gammaAlpha, att_betaAlpha, att_gammaD, att_deltaD, att_wGrad, att_wLap, att_wE, att_wDef, att_contextR],
+    [att_DA, att_DU, att_muA, att_muU, att_lambdaS, att_lambdaC, att_topo, att_gammaK, att_betaK, att_gammaAlpha, att_betaAlpha, att_gammaD, att_deltaD, att_wGrad, att_wLap, att_wE, att_wDef, att_contextR, att_reflectorGain],
   );
   const attentionHeads = useMemo(() => [head1, head2, head3], [head1, head2, head3]);
 
@@ -230,6 +371,18 @@ export default function KuramotoPainter() {
     swWeight,
     swNegFrac,
     reseedGraphKey,
+    // Topological pockets
+    pocketParams: {
+      enabled: pocketEnabled,
+      scoreWeights: { rho: pocketWRho, attn: pocketWAttn, shear: pocketWShear, defects: pocketWDef },
+      scoreThresh: pocketThresh,
+      minArea: Math.max(1, Math.floor(pocketMinArea)),
+      horizon: pocketHorizon,
+      Kboost: pocketKboost,
+    },
+    // Opaque substrate (PAT token-only attention)
+    opaqueSubstrateMode: tokenOnly,
+    patScale,
     // Attention
     attentionEnabled,
     attentionParams,
@@ -561,54 +714,114 @@ export default function KuramotoPainter() {
     setPatUsage(coverage);
     setPatEntropy(normEntropy);
     // Affect headers
-    const aff = computeAffectHeaders(sim);
+    const aff = computeAffect(sim);
     setArousal(Number.isFinite(aff.arousal) ? aff.arousal : 0);
     setValence(Number.isFinite(aff.valence) ? aff.valence : 0);
   }, [getSim]);
 
   // Reverse config builder mirroring engine step config
-  const buildReverseConfig = useCallback((): StepConfig => ({
-    dt,
-    wrap,
-    Kbase,
-    K1,
-    K2,
-    K3,
-    KS1,
-    KS2,
-    KS3,
-    KH1,
-    KH2,
-    KH3,
-    alphaSurfToField,
-    alphaFieldToSurf,
-    alphaHypToField,
-    alphaFieldToHyp,
-    swWeight,
-    wallBarrier,
-    emGain,
-    energyBaseline,
-    energyLeak,
-    energyDiff,
-    sinkLine,
-    sinkSurf,
-    sinkHyp,
-    trapSurf,
-    trapHyp,
-    minEnergySurf,
-    minEnergyHyp,
-    noiseAmp,
-    dagSweeps,
-    dagDepthOrdering,
-    dagDepthFiltering,
-    dagLogStats,
-    horizonFactor: (iInside: boolean, jInside: boolean, receiverInside: boolean) => {
-      if (iInside === jInside) return 1.0;
-      if (receiverInside && !jInside) return 1.0;
-      if (!receiverInside && jInside) return 1.0 - eventBarrier;
-      return 1.0;
-    },
-  }), [
+  const buildReverseConfig = useCallback((): StepConfig => {
+    const sim = getSim();
+    // Build attention mods on demand so both forward (manual) and reverse honor gates
+    let mods: AttentionMods | undefined = undefined;
+    if (attentionEnabled && sim) {
+      if (tokenOnly) {
+        const tokens = buildPATokens(sim, (patScale as 32 | 64) ?? 32);
+        const proxy = tokensToAttentionFields(tokens, W, H, ((patScale as 32 | 64) ?? 32));
+        mods = {
+          Aact: proxy.Aact,
+          Uact: proxy.Uact,
+          lapA: proxy.lapA,
+          divU: proxy.divU,
+          etaV: 0,
+          gammaK: att_gammaK,
+          betaK: att_betaK,
+          gammaAlpha: att_gammaAlpha,
+          betaAlpha: att_betaAlpha,
+          gammaD: att_gammaD,
+          deltaD: att_deltaD,
+        };
+      } else {
+        // Use a simple deterministic time base for reverse utilities
+        const out = updateAttentionFields(sim, [head1, head2, head3], attentionParams, dt, 0, wrap);
+        mods = {
+          Aact: out.Aact,
+          Uact: out.Uact,
+          lapA: out.lapA,
+          divU: out.divU,
+          A: out.A,
+          lapAraw: out.lapAraw,
+          advect: out.advect,
+          etaV: attentionParams.etaV ?? 0,
+          gammaK: att_gammaK,
+          betaK: att_betaK,
+          gammaAlpha: att_gammaAlpha,
+          betaAlpha: att_betaAlpha,
+          gammaD: att_gammaD,
+          deltaD: att_deltaD,
+        };
+      }
+    }
+    return {
+      dt,
+      wrap,
+      Kbase,
+      K1,
+      K2,
+      K3,
+      KS1,
+      KS2,
+      KS3,
+      KH1,
+      KH2,
+      KH3,
+      alphaSurfToField,
+      alphaFieldToSurf,
+      alphaHypToField,
+      alphaFieldToHyp,
+      swWeight,
+      wallBarrier,
+      emGain,
+      energyBaseline,
+      energyLeak,
+      energyDiff,
+      sinkLine,
+      sinkSurf,
+      sinkHyp,
+      trapSurf,
+      trapHyp,
+      minEnergySurf,
+      minEnergyHyp,
+      noiseAmp,
+      dagSweeps,
+      dagDepthOrdering,
+      dagDepthFiltering,
+      dagLogStats,
+      attentionMods: mods,
+      horizonFactor: (iInside: boolean, jInside: boolean, receiverInside: boolean) => {
+        if (iInside === jInside) return 1.0;
+        if (receiverInside && !jInside) return 1.0;
+        if (!receiverInside && jInside) return 1.0 - eventBarrier;
+        return 1.0;
+      },
+    };
+  }, [
+    getSim,
+    attentionEnabled,
+    tokenOnly,
+    W,
+    H,
+    patScale,
+    head1,
+    head2,
+    head3,
+    attentionParams,
+    att_gammaK,
+    att_betaK,
+    att_gammaAlpha,
+    att_betaAlpha,
+    att_gammaD,
+    att_deltaD,
     dt, wrap, Kbase, K1, K2, K3, KS1, KS2, KS3, KH1, KH2, KH3,
     alphaSurfToField, alphaFieldToSurf, alphaHypToField, alphaFieldToHyp,
     swWeight, wallBarrier, emGain, energyBaseline, energyLeak, energyDiff,
@@ -616,23 +829,97 @@ export default function KuramotoPainter() {
     noiseAmp, dagSweeps, dagDepthOrdering, dagDepthFiltering, dagLogStats, eventBarrier
   ]);
 
+  // Forward/Reverse multi-step helpers
+  const handleForward = useCallback(() => {
+    const sim = getSim();
+    if (!sim) return;
+    const frames = Math.max(1, Math.floor(stepBurst));
+    // Simple "wide terminal" schedule: lower K, raise D
+    const fSched = {
+      K: (t: number) => Math.max(0.05, Kbase * (1 - t)),
+      D: (t: number) => Math.max(0, noiseAmp + 0.2 * t),
+    };
+    runForward(sim, () => buildReverseConfig(), frames, fSched);
+  }, [buildReverseConfig, getSim, stepBurst, Kbase, noiseAmp]);
+
+  const handleReverse = useCallback(() => {
+    const sim = getSim();
+    if (!sim) return;
+    const frames = Math.max(1, Math.floor(stepBurst));
+    const rSched = {
+      K: (t: number) => Math.max(0.05, Kbase * (1 - t)),
+      D: (t: number) => Math.max(0, noiseAmp + 0.2 * t),
+    };
+    runReverse(sim, () => buildReverseConfig(), frames, 0.5, { sched: rSched, t0: 1, t1: 0 });
+  }, [buildReverseConfig, getSim, stepBurst, Kbase, noiseAmp]);
+
   const handleReverseStep = useCallback(() => {
     const sim = getSim();
     if (!sim) return;
-    const cfg = buildReverseConfig();
-    reverseStepInPlace(sim, cfg, 0.5);
+    runReverse(sim, () => buildReverseConfig(), 1, 0.5);
   }, [buildReverseConfig, getSim]);
 
   const handleFwdToRev = useCallback(() => {
     const sim = getSim();
     if (!sim) return;
+    // Start from fresh phases for a clean demo
     resetPhases();
-    const cfg = buildReverseConfig();
     const frames = Math.max(1, Math.floor(stepBurst));
-    for (let i = 0; i < frames; i++) {
-      reverseStepInPlace(sim, cfg, 0.5);
+    const fSched = {
+      K: (t: number) => Math.max(0.05, Kbase * (1 - t)),
+      D: (t: number) => Math.max(0, noiseAmp + 0.2 * t),
+    };
+    runFwdRev(
+      sim,
+      () => buildReverseConfig(),
+      { steps: frames, sched: fSched },
+      { steps: frames, t: 0.5, sched: fSched },
+    );
+  }, [buildReverseConfig, getSim, resetPhases, stepBurst, Kbase, noiseAmp]);
+
+  // Schedules for plotting and recording
+  const schedK = useCallback((t: number) => Math.max(0.05, Kbase * (1 - t)), [Kbase]);
+  const schedKref = useCallback((t: number) => Math.max(0, 0.5 * Kbase * (1 - t)), [Kbase]);
+  const schedPsi = useCallback((t: number) => 0, []);
+  const schedD = useCallback((t: number) => Math.max(0, noiseAmp + 0.2 * t), [noiseAmp]);
+
+  const handleRecordFwdToRev = useCallback(() => {
+    const sim = getSim();
+    if (!sim) return;
+    // Sample schedules for serialization
+    const T = 101;
+    const tSeries: number[] = [];
+    const kSeries: number[] = [];
+    const dSeries: number[] = [];
+    const krefSeries: number[] = [];
+    const psiSeries: number[] = [];
+    for (let i = 0; i < T; i++) {
+      const t = i / (T - 1);
+      tSeries.push(t);
+      kSeries.push(schedK(t));
+      dSeries.push(schedD(t));
+      krefSeries.push(schedKref(t));
+      psiSeries.push(schedPsi(t));
     }
-  }, [buildReverseConfig, getSim, resetPhases, stepBurst]);
+    // Record snapshots at start, mid, end
+    const rec = startSceneRecorder(getSim);
+    rec.snapshot(0.0);
+    const frames = Math.max(1, Math.floor(stepBurst));
+    const fSched = { K: schedK, D: schedD };
+    runForward(sim, () => buildReverseConfig(), frames, fSched, 0, 1);
+    rec.snapshot(0.5);
+    runReverse(sim, () => buildReverseConfig(), frames, 0.5, { sched: fSched, t0: 1, t1: 0 });
+    rec.snapshot(1.0);
+    const scene = rec.stop();
+    const json = serializeSceneWithSchedules(scene, { t: tSeries, K: kSeries, D: dSeries, Kref: krefSeries, psi: psiSeries });
+    const blob = new Blob([JSON.stringify(json)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "scene_fwd_rev.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [getSim, stepBurst, buildReverseConfig, schedK, schedD]);
 
   const handleFitW = useCallback(() => {
     const sim = getSim();
@@ -683,6 +970,42 @@ export default function KuramotoPainter() {
     }
   }, [getSim]);
 
+  // PAT stream start/stop
+  const makePATFrame = useCallback(() => {
+    const sim = getSim();
+    if (!sim) return null;
+    return buildPATokens(sim, patScale);
+  }, [getSim, patScale]);
+
+  const handleStartPAT = useCallback(() => {
+    try {
+      patStreamRef.current?.stop();
+    } catch {}
+    const handle = startPATStream(makePATFrame, { url: patStreamUrl, fps: Math.max(1, Math.floor(patStreamFps)) });
+    patStreamRef.current = handle;
+    setPatStreaming(true);
+  }, [makePATFrame, patStreamUrl, patStreamFps]);
+
+  const handleStopPAT = useCallback(() => {
+    try {
+      patStreamRef.current?.stop();
+    } catch {}
+    patStreamRef.current = null;
+    setPatStreaming(false);
+  }, []);
+
+  // TokenAtlas live updater
+  useEffect(() => {
+    if (!tokenAtlasLive) return;
+    const id = setInterval(() => {
+      const sim = getSim();
+      if (!sim) return;
+      const toks = buildPATokens(sim, patScale);
+      setTokenAtlasTokens(toks);
+    }, Math.max(100, tokenAtlasEveryMs));
+    return () => clearInterval(id);
+  }, [tokenAtlasLive, tokenAtlasEveryMs, getSim, patScale]);
+
   const handleDeterminismTest = useCallback(() => {
     const sim = getSim();
     if (!sim) return;
@@ -717,12 +1040,78 @@ export default function KuramotoPainter() {
     const id = setInterval(() => {
       const sim = getSim();
       if (!sim) return;
-      const aff = computeAffectHeaders(sim);
+      const aff = computeAffect(sim);
       setArousal(Number.isFinite(aff.arousal) ? aff.arousal : 0);
       setValence(Number.isFinite(aff.valence) ? aff.valence : 0);
     }, 500);
     return () => clearInterval(id);
   }, [getSim]);
+
+  // Sync deterministic policy seed when step seed changes or control toggles
+  useEffect(() => {
+    policySeedRef.current = Number.isFinite(transportSeed) ? Math.floor(transportSeed) : 0;
+    policyFrameRef.current = 0;
+  }, [transportSeed, valenceControl]);
+
+  // Deterministic valence policy loop: every N frames adjust γK/γD/γα toward higher valence, arousal in band
+  useEffect(() => {
+    if (!valenceControl) return;
+    let raf = 0;
+    const tick = () => {
+      const sim = getSim();
+      if (sim && attentionEnabled && !paused) {
+        const n = Math.max(1, Math.floor(policyEveryN));
+        policyFrameRef.current += 1;
+        if (policyFrameRef.current % n === 0) {
+          const aff = computeAffect(sim);
+          const cur = {
+            gammaK: att_gammaK,
+            gammaAlpha: att_gammaAlpha,
+            gammaD: att_gammaD,
+            deltaD: att_deltaD,
+            heads: [head1, head2, head3].map((h) => ({ enabled: h.enabled, weight: h.weight })),
+          };
+          const cfg = {
+            targetArousal: [Math.max(0, targetArousal - arousalBand), Math.min(1, targetArousal + arousalBand)] as [number, number],
+            steps: 1,
+            gammaK: [0, 1] as [number, number],
+            gammaAlpha: [0, 0.5] as [number, number],
+            gammaD: [0, 0.8] as [number, number],
+            deltaD: [0, 0.3] as [number, number],
+            headWeightBounds: [0, 1] as [number, number],
+          };
+          const res = stepValencePolicy(aff, cur, policySeedRef.current | 0, cfg);
+          // Apply clamp-safe updates
+          setAtt_gammaK(res.gammaK);
+          setAtt_gammaAlpha(res.gammaAlpha);
+          setAtt_gammaD(res.gammaD);
+          // Keep δD stable for now; enable if policy starts returning tuned values
+          // setAtt_deltaD(res.deltaD);
+
+          // Deterministic seed advance (LCG)
+          policySeedRef.current = ((policySeedRef.current * 1664525 + 1013904223) >>> 0);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [
+    valenceControl,
+    getSim,
+    attentionEnabled,
+    paused,
+    policyEveryN,
+    att_gammaK,
+    att_gammaAlpha,
+    att_gammaD,
+    att_deltaD,
+    head1,
+    head2,
+    head3,
+    targetArousal,
+    arousalBand,
+  ]);
 
   useEffect(() => {
     if (typeof console === "undefined") return;
@@ -811,6 +1200,12 @@ export default function KuramotoPainter() {
           </button>
           <button onClick={handleStepBurst} className="px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
             Step
+          </button>
+          <button onClick={handleForward} className="px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
+            Forward
+          </button>
+          <button onClick={handleReverse} className="px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
+            Reverse
           </button>
           <button onClick={handleReverseStep} className="px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
             Rev Step
@@ -949,6 +1344,17 @@ export default function KuramotoPainter() {
             </button>
             <Toggle value={transformTool} onChange={setTransformTool} label="Transform tool" />
           </div>
+        </Section>
+
+        <Section title="Schedules">
+          <Row label="K(t) vs D(t)" full>
+            <div className="flex gap-3 w-full items-center">
+              <SchedulePlot K={schedK} D={schedD} Kref={schedKref} />
+              <button onClick={handleRecordFwdToRev} className="px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
+                Record Fwd→Rev
+              </button>
+            </div>
+          </Row>
         </Section>
 
         <Section title="Evaluation & Tests">
@@ -1129,6 +1535,47 @@ export default function KuramotoPainter() {
           </Row>
         </Section>
 
+        <Section title="Pockets">
+          <Row label="Enable">
+            <Toggle value={pocketEnabled} onChange={setPocketEnabled} label="Detect pockets" />
+          </Row>
+          <Row label="Horizon">
+            <select
+              value={pocketHorizon}
+              onChange={(e) => setPocketHorizon(e.target.value as "sealed" | "oneway" | "none")}
+              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+            >
+              <option value="sealed">sealed</option>
+              <option value="oneway">oneway</option>
+              <option value="none">none</option>
+            </select>
+          </Row>
+          <Row label="K boost">
+            <Range value={pocketKboost} min={0} max={2} step={0.05} onChange={setPocketKboost} />
+          </Row>
+          <Row label="Score w">
+            <div className="flex gap-2 w-full">
+              <Range value={pocketWRho} min={0} max={2} step={0.05} onChange={setPocketWRho} />
+              <Range value={pocketWAttn} min={0} max={2} step={0.05} onChange={setPocketWAttn} />
+              <Range value={pocketWShear} min={0} max={2} step={0.05} onChange={setPocketWShear} />
+              <Range value={pocketWDef} min={0} max={2} step={0.05} onChange={setPocketWDef} />
+            </div>
+          </Row>
+          <Row label="Thresh">
+            <Range value={pocketThresh} min={0} max={2} step={0.01} onChange={setPocketThresh} />
+          </Row>
+          <Row label="Min area">
+            <input
+              type="number"
+              min={1}
+              max={W * H}
+              value={pocketMinArea}
+              onChange={(e) => setPocketMinArea(Number.parseInt(e.target.value, 10) || 1)}
+              className="w-28 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+            />
+          </Row>
+        </Section>
+
         <Section title="DAG-Time & Horizon">
           <Row label="Event barrier">
             <Range value={eventBarrier} min={0} max={1} step={0.05} onChange={setEventBarrier} />
@@ -1267,6 +1714,9 @@ export default function KuramotoPainter() {
           <Row label="Context R">
             <Range value={att_contextR} min={0} max={16} step={1} onChange={setAtt_contextR} />
           </Row>
+          <Row label="Reflector gain">
+            <Range value={att_reflectorGain} min={0} max={2.0} step={0.05} onChange={setAtt_reflectorGain} />
+          </Row>
           <Row label="Head 1">
             <div className="flex gap-2 w-full">
               <Toggle value={head1.enabled} onChange={(v)=>setHead1({...head1, enabled:v})} label="On" />
@@ -1295,6 +1745,8 @@ export default function KuramotoPainter() {
             </div>
           </Row>
         </Section>
+
+        <ReflectorGraphPanel getSim={getSim} />
 
         <Section title="Lift & Stereo">
           <Row label="Lift gain">
@@ -1352,10 +1804,80 @@ export default function KuramotoPainter() {
           <Row label="Target valence">
             <Range value={targetValence} min={0} max={1} step={0.01} onChange={setTargetValence} />
           </Row>
+          <Row label="Valence control">
+            <Toggle value={valenceControl} onChange={setValenceControl} label="Enable" />
+          </Row>
+          <Row label="Arousal band ±">
+            <Range value={arousalBand} min={0} max={0.5} step={0.01} onChange={setArousalBand} />
+          </Row>
+          <Row label="Policy N-frames">
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={policyEveryN}
+              onChange={(e) => setPolicyEveryN(Number.parseInt(e.target.value, 10) || 1)}
+              className="w-24 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+            />
+          </Row>
+          <Row label="Token-only (PAT)">
+            <Toggle value={tokenOnly} onChange={setTokenOnly} label="Opaque substrate" />
+          </Row>
+          <Row label="TokenAtlas live">
+            <div className="flex gap-2 w-full">
+              <Toggle value={tokenAtlasLive} onChange={setTokenAtlasLive} label="Enable" />
+              <input
+                type="number"
+                min={100}
+                max={5000}
+                value={tokenAtlasEveryMs}
+                onChange={(e) => setTokenAtlasEveryMs(Number.parseInt(e.target.value, 10) || 1000)}
+                className="w-28 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+              />
+              <span className="text-[11px] text-zinc-500 self-center">ms</span>
+            </div>
+          </Row>
+          <Row label="PAT stream URL">
+            <input
+              type="text"
+              value={patStreamUrl}
+              onChange={(e) => setPatStreamUrl(e.target.value)}
+              className="w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+            />
+          </Row>
+          <Row label="FPS / Scale">
+            <div className="flex gap-2 w-full">
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={patStreamFps}
+                onChange={(e) => setPatStreamFps(Number.parseInt(e.target.value, 10) || 1)}
+                className="w-24 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+              />
+              <select
+                value={patScale}
+                onChange={(e) => setPatScale(Number(e.target.value) as 32 | 64)}
+                className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200"
+              >
+                <option value={32}>32</option>
+                <option value={64}>64</option>
+              </select>
+              <button
+                onClick={patStreaming ? handleStopPAT : handleStartPAT}
+                className={`px-3 py-1 rounded-xl ${patStreaming ? "bg-rose-800 hover:bg-rose-700" : "bg-zinc-800 hover:bg-zinc-700"}`}
+              >
+                {patStreaming ? "Stop PAT Stream" : "Start PAT Stream"}
+              </button>
+            </div>
+          </Row>
           <Row label="PAT" full>
             <button onClick={handleComputePAT} className="w-full px-3 py-1 rounded-xl bg-zinc-800 hover:bg-zinc-700">
               Compute PAT Snapshot
             </button>
+          </Row>
+          <Row label="TokenAtlas" full>
+            <TokenAtlas tokens={tokenAtlasTokens} />
           </Row>
           {typeof patMSE === "number" && (
             <>

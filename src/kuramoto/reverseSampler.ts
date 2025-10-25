@@ -6,7 +6,9 @@ export type Patch = { idx: Int32Array; weights: Float32Array };
 
 /** Modest concentration ramp as τ ↓ 0 */
 export function kappaSchedule(t: number) {
-  return 2.0 + 6.0 * (1 - t);
+  // Higher concentration early (t≈0), smoother late (t≈1)
+  // Range ~[8, 24] → tuneable if needed
+  return 8.0 + 16.0 * (1 - t);
 }
 
 /** Non-ML local Parzen score on S¹ using von-Mises KDE gradient */
@@ -16,14 +18,18 @@ export function parzenScore(theta: Float32Array, patches: Patch[], t: number): F
   const kap = kappaSchedule(t);
   for (let i = 0; i < N; i++) {
     const P = patches[i];
-    let acc = 0;
     const idx = P.idx;
     const w = P.weights;
+    let num = 0;
+    let den = 0;
     for (let k = 0; k < idx.length; k++) {
       const j = idx[k];
-      acc += w[k] * kap * Math.sin(theta[j] - theta[i]);
+      const d = theta[j] - theta[i];
+      const ew = Math.exp(kap * Math.cos(d));
+      num += w[k] * ew * (kap * Math.sin(d));
+      den += w[k] * ew;
     }
-    s[i] = acc;
+    s[i] = den > 1e-8 ? num / den : 0;
   }
   return s;
 }
